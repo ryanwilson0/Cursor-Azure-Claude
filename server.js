@@ -684,12 +684,27 @@ async function handleChatCompletions(req, res) {
       }
     }, 15000);
 
-    req.on("close", () => {
+    res.on("close", () => {
       clientClosed = true;
       if (keepalive) clearInterval(keepalive);
-      console.log(`[${reqId}] [DEBUG] client_disconnected`);
+      console.log(`[${reqId}] [DEBUG] response_closed_by_client`);
     });
-  }
+
+    // If the client aborts the request mid-flight, this is a true abort signal.
+    req.on("aborted", () => {
+      clientClosed = true;
+      if (keepalive) clearInterval(keepalive);
+      console.log(`[${reqId}] [DEBUG] request_aborted_by_client`);
+    });
+
+    // Keepalive: send an actual SSE data chunk (NOT a ":" comment) so Cursor/proxies don’t buffer it.
+    keepalive = setInterval(() => {
+      try {
+        if (!clientClosed) sse.writeChunk({}, null);
+      } catch (_) {
+        clearInterval(keepalive);
+      }
+    }, 15000);
 
   try {
     if (!CONFIG.AZURE_API_KEY) {
@@ -730,8 +745,8 @@ async function handleChatCompletions(req, res) {
 
     if (keepalive) clearInterval(keepalive);
 
-    if (clientClosed) {
-      console.log(`[${reqId}] [DEBUG] client_closed_before_response_processing`);
+    if (clientClosed || res.writableEnded || res.destroyed) {
+      console.log(`[${reqId}] [DEBUG] response_not_writable; skipping processing`);
       return;
     }
 
