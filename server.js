@@ -419,7 +419,6 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
       });
     }
 
-    const wantStream = req.body.stream === true;
     const toolsPresent = Array.isArray(req.body?.tools) && req.body.tools.length > 0;
 
     // If tools are present, do NOT stream (our fake SSE doesn't support tool_calls deltas).
