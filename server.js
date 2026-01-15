@@ -387,21 +387,26 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
 
   try {
     if (!CONFIG.AZURE_API_KEY) {
+      console.error("[ERROR] Azure API key not configured");
       return res.status(500).json({ error: { message: "Azure API key not configured", type: "configuration_error" } });
     }
     if (!CONFIG.AZURE_ENDPOINT) {
+      console.error("[ERROR] Azure endpoint not configured");
       return res.status(500).json({ error: { message: "Azure endpoint not configured", type: "configuration_error" } });
     }
     if (!req.body) {
+      console.error("[ERROR] Empty request body");
       return res.status(400).json({ error: { message: "Invalid request: empty body", type: "invalid_request_error" } });
     }
 
-    const hasMessages = req.body.messages && Array.isArray(req.body.messages);
+    // Validate request has something we can turn into messages
+    const hasMessages = Array.isArray(req.body.messages);
     const hasRoleContent = req.body.role && req.body.content;
     const hasInput = req.body.input && (Array.isArray(req.body.input) || typeof req.body.input === "string");
     const hasContent = req.body.content;
 
     if (!hasMessages && !hasRoleContent && !hasInput && !hasContent) {
+      console.error("[ERROR] Invalid request body keys:", Object.keys(req.body));
       return res.status(400).json({
         error: {
           message: "Invalid request: must include messages, role/content, input, or content field",
@@ -410,45 +415,21 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
       });
     }
 
-    const toolsPresent = Array.isArray(req.body?.tools) && req.body.tools.length > 0;
-
-    // Allow streaming ONLY when no tools are present (tool streaming not implemented here)
     const wantStream = req.body.stream === true;
-    const isStreaming = wantStream && !toolsPresent;
 
-    // Transform request to Anthropic format
-    const anthropicRequest = transformRequest(req.body);
-    anthropicRequest.stream = isStreaming;
+    // IMPORTANT: always call Azure in NON-streaming mode
+    req.body.stream = false;
 
-    if (!isStreaming) {
-      // Non-streaming JSON path
-      const response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": CONFIG.AZURE_API_KEY,
-          "anthropic-version": CONFIG.ANTHROPIC_VERSION,
-        },
-        timeout: 120000,
-        responseType: "json",
-        validateStatus: (s) => s < 600,
-      });
-
-      if (response.status >= 400) {
-        const msg = response.data?.error?.message || response.data?.message || "Azure API error";
-        return res.status(response.status).json({ error: { message: msg, type: "api_error", code: response.status } });
-      }
-
-      const openAIResponse = transformResponse(response.data, req.body?.model);
-      // Cursor tolerance hardening
-      const m = openAIResponse?.choices?.[0]?.message;
-      if (m && m.content == null) m.content = "";
-      if (openAIResponse?.choices?.[0] && m?.tool_calls?.length) openAIResponse.choices[0].finish_reason = "tool_calls";
-
-      res.setHeader("Content-Type", "application/json; charset=utf-8");
-      return res.status(200).json(openAIResponse);
+    let anthropicRequest;
+    try {
+      anthropicRequest = transformRequest(req.body);
+      anthropicRequest.stream = false;
+    } catch (e) {
+      console.error("[ERROR] transformRequest failed:", e);
+      return res.status(400).json({ error: { message: "Failed to transform request: " + e.message, type: "transform_error" } });
     }
 
-    // Streaming SSE path (OpenAI-compatible)
+    console.log("[AZURE] Calling Azure Anthropic API (non-streaming)...");
     const response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
       headers: {
         "Content-Type": "application/json",
@@ -456,123 +437,73 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
         "anthropic-version": CONFIG.ANTHROPIC_VERSION,
       },
       timeout: 120000,
-      responseType: "stream",
+      responseType: "json",
       validateStatus: (s) => s < 600,
     });
 
+    console.log("[AZURE] Response status:", response.status);
+
     if (response.status >= 400) {
-      // Read stream error body (best effort)
-      let errorBuf = "";
-      await new Promise((resolve) => {
-        response.data.on("data", (c) => (errorBuf += c.toString()));
-        response.data.on("end", resolve);
-        response.data.on("error", resolve);
-      });
-      return res.status(response.status).json({
-        error: {
-          message: errorBuf || "Azure API error",
-          type: "api_error",
-          code: response.status,
-        },
-      });
+      const msg = response.data?.error?.message || response.data?.message || "Azure API error";
+      console.error("[ERROR] Azure error:", msg);
+      return res.status(response.status).json({ error: { message: msg, type: "api_error", code: response.status } });
     }
 
+    // Build OpenAI response JSON
+    const openAIResponse = transformResponse(response.data, req.body?.model);
+    const choice = openAIResponse?.choices?.[0];
+    const message = choice?.message || { role: "assistant", content: "" };
+
+    // Cursor tolerance: ensure content is a string
+    if (message.content == null) message.content = "";
+
+    if (!wantStream) {
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      console.log("[RESPONSE] Sending JSON response");
+      return res.status(200).json(openAIResponse);
+    }
+
+    // --- Fake SSE streaming for Cursor (OpenAI-compatible) ---
+    console.log("[RESPONSE] Sending SSE (fake streaming)...");
+    const id = openAIResponse.id || ("chatcmpl-" + Date.now().toString(36));
+    const created = openAIResponse.created || Math.floor(Date.now() / 1000);
+    const model = openAIResponse.model || (req.body?.model || "claude-opus-4-5");
+
+    res.status(200);
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders?.();
 
-    const requestedModel = req.body?.model || "claude-opus-4-5";
-    const openaiId = "chatcmpl-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
-    const created = Math.floor(Date.now() / 1000);
-
-    // OpenAI streaming: send role first (many clients expect this)
-    let sentRole = false;
-
-    function sendChunk(delta, finish_reason = null) {
+    const send = (delta, finish_reason = null) => {
       const chunk = {
-        id: openaiId,
+        id,
         object: "chat.completion.chunk",
         created,
-        model: requestedModel,
-        choices: [
-          {
-            index: 0,
-            delta,
-            finish_reason,
-          },
-        ],
+        model,
+        choices: [{ index: 0, delta, finish_reason }],
       };
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    };
+
+    // Many clients expect role first
+    send({ role: "assistant" }, null);
+
+    // Stream content as one chunk (simple and compatible)
+    if (typeof message.content === "string" && message.content.length) {
+      send({ content: message.content }, null);
     }
 
-    // initial role chunk
-    sendChunk({ role: "assistant" }, null);
-    sentRole = true;
-
-    let buffer = "";
-
-    response.data.on("data", (chunk) => {
-      buffer += chunk.toString();
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const data = line.slice(6).trim();
-
-        if (!data || data === "[DONE]") continue;
-
-        let evt;
-        try {
-          evt = JSON.parse(data);
-        } catch {
-          continue;
-        }
-
-        // Anthropic/Azure streaming events
-        if (evt.type === "content_block_delta") {
-          const text = evt.delta?.text;
-          if (typeof text === "string" && text.length) {
-            if (!sentRole) {
-              sendChunk({ role: "assistant" }, null);
-              sentRole = true;
-            }
-            sendChunk({ content: text }, null);
-          }
-        }
-
-        if (evt.type === "message_stop") {
-          // final chunk
-          sendChunk({}, "stop");
-          res.write("data: [DONE]\n\n");
-          res.end();
-        }
-      }
-    });
-
-    response.data.on("end", () => {
-      // If stream ends without message_stop, still close properly
-      try {
-        sendChunk({}, "stop");
-        res.write("data: [DONE]\n\n");
-      } catch {}
-      res.end();
-    });
-
-    response.data.on("error", (err) => {
-      console.error("[ERROR] Stream error:", err?.message || err);
-      try {
-        res.write(`data: ${JSON.stringify({ error: { message: "Stream error", type: "stream_error" } })}\n\n`);
-        res.write("data: [DONE]\n\n");
-      } catch {}
-      res.end();
-    });
+    // Finish
+    send({}, "stop");
+    res.write("data: [DONE]\n\n");
+    return res.end();
   } catch (error) {
     console.error("[ERROR] Exception in /chat/completions:", error.message);
     return res.status(500).json({ error: { message: error.message, type: "proxy_error" } });
   }
 });
+
 
 app.post("/v1/chat/completions", requireAuth, (req, res) => {
   res.redirect(307, "/chat/completions");
