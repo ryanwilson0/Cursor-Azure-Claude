@@ -525,160 +525,151 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
   }
 });
 
-
-// Main proxy endpoint
+// Main proxy endpoint (OpenAI-style)
 app.post("/v1/chat/completions", requireAuth, async (req, res) => {
-    console.log("[REQUEST]", new Date().toISOString());
-    console.log("Body:", JSON.stringify(req.body, null, 2));
+  console.log("[REQUEST /v1/chat/completions]", new Date().toISOString());
+  // Avoid logging full body in production; it can be huge and may contain sensitive data
+  // console.log("Body:", JSON.stringify(req.body, null, 2));
+  console.log("Model:", req.body?.model, "Stream:", req.body?.stream);
 
-    try {
-        // Validate API key
-        if (!CONFIG.AZURE_API_KEY || CONFIG.AZURE_API_KEY === "YOUR_ACTUAL_API_KEY_HERE") {
-            console.error("[ERROR] Azure API key not configured");
-            throw new Error("Azure API key not configured. Set AZURE_API_KEY environment variable.");
-        }
-
-        const toolsPresent = Array.isArray(req.body?.tools) && req.body.tools.length > 0;
-        const isStreaming = req.body.stream === true && !toolsPresent;
-        
-        const anthropicRequest = transformRequest(req.body);
-        anthropicRequest.stream = false;
-
-        console.log("[AZURE] Calling Azure Anthropic API...");
-        console.log("Transformed request:", JSON.stringify(anthropicRequest, null, 2));
-
-        // Call Azure Anthropic API
-        const response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
-            headers: {
-                "Content-Type": "application/json",
-                "x-api-key": CONFIG.AZURE_API_KEY,
-                "anthropic-version": CONFIG.ANTHROPIC_VERSION,
-            },
-            timeout: 120000,
-            responseType: "json",
-        });
-
-        if (isStreaming) {
-            // Set headers for SSE streaming
-            res.setHeader("Content-Type", "text/event-stream");
-            res.setHeader("Cache-Control", "no-cache");
-            res.setHeader("Connection", "keep-alive");
-
-            console.log("[AZURE] Streaming response...");
-
-            let buffer = "";
-
-            response.data.on("data", (chunk) => {
-                buffer += chunk.toString();
-                const lines = buffer.split("\n");
-                buffer = lines.pop(); // Keep incomplete line in buffer
-
-                for (const line of lines) {
-                    if (line.startsWith("data: ")) {
-                        const data = line.slice(6).trim();
-                        if (data === "[DONE]") {
-                            res.write("data: [DONE]\n\n");
-                            continue;
-                        }
-
-                        try {
-                            const anthropicEvent = JSON.parse(data);
-
-                            // Transform Anthropic streaming events to OpenAI format
-                            if (anthropicEvent.type === "content_block_delta") {
-                                const openaiChunk = {
-                                    id: anthropicEvent.id || "chatcmpl-" + Date.now(),
-                                    object: "chat.completion.chunk",
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: req.body.model || "claude-opus-4-5",
-                                    choices: [
-                                        {
-                                            index: 0,
-                                            delta: {
-                                                content: anthropicEvent.delta?.text || "",
-                                            },
-                                            finish_reason: null,
-                                        },
-                                    ],
-                                };
-                                res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
-                            } else if (anthropicEvent.type === "message_stop") {
-                                const openaiChunk = {
-                                    id: "chatcmpl-" + Date.now(),
-                                    object: "chat.completion.chunk",
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: req.body.model || "claude-opus-4-5",
-                                    choices: [
-                                        {
-                                            index: 0,
-                                            delta: {},
-                                            finish_reason: "stop",
-                                        },
-                                    ],
-                                };
-                                res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
-                                res.write("data: [DONE]\n\n");
-                            }
-                        } catch (e) {
-                            console.error("[ERROR] Failed to parse streaming chunk:", e);
-                        }
-                    }
-                }
-            });
-
-            response.data.on("end", () => {
-                console.log("[AZURE] Stream ended");
-                res.end();
-            });
-
-            response.data.on("error", (error) => {
-                console.error("[ERROR] Stream error:", error);
-                res.end();
-            });
-        } else {
-            console.log("[AZURE] Response received successfully");
-
-            // Transform response
-            const openAIResponse = transformResponse(response.data);
-            console.log("[RESPONSE] Sending response to client");
-
-            res.json(openAIResponse);
-        }
-    } catch (error) {
-        console.error("[ERROR]", error.message);
-
-        if (error.response) {
-            console.error("[ERROR] Azure API error:", {
-                status: error.response.status,
-                data: error.response.data,
-            });
-
-            res.status(error.response.status).json({
-                error: {
-                    message: error.response.data.error?.message || "Azure API error",
-                    type: error.response.data.error?.type || "api_error",
-                    code: error.response.status,
-                },
-            });
-        } else if (error.request) {
-            console.error("[ERROR] No response from Azure API");
-            res.status(503).json({
-                error: {
-                    message: "Unable to reach Azure Anthropic API",
-                    type: "connection_error",
-                },
-            });
-        } else {
-            console.error("[ERROR] Request setup error");
-            res.status(500).json({
-                error: {
-                    message: error.message,
-                    type: "proxy_error",
-                },
-            });
-        }
+  try {
+    // Validate Azure config
+    if (!CONFIG.AZURE_API_KEY || CONFIG.AZURE_API_KEY === "YOUR_ACTUAL_API_KEY_HERE") {
+      console.error("[ERROR] Azure API key not configured");
+      return res.status(500).json({
+        error: {
+          message: "Azure API key not configured. Set AZURE_API_KEY environment variable.",
+          type: "configuration_error",
+        },
+      });
     }
+    if (!CONFIG.AZURE_ENDPOINT) {
+      console.error("[ERROR] Azure endpoint not configured");
+      return res.status(500).json({
+        error: { message: "Azure endpoint not configured", type: "configuration_error" },
+      });
+    }
+
+    // Force non-streaming (Cursor/provider clients sometimes send stream:true; this proxy
+    // does not fully implement OpenAI-compatible streaming + tool deltas)
+    req.body.stream = false;
+    const isStreaming = false;
+
+    // Transform request
+    let anthropicRequest;
+    try {
+      anthropicRequest = transformRequest(req.body);
+      anthropicRequest.stream = false;
+    } catch (transformError) {
+      console.error("[ERROR] Failed to transform request:", transformError);
+      return res.status(400).json({
+        error: {
+          message: "Failed to transform request: " + transformError.message,
+          type: "transform_error",
+        },
+      });
+    }
+
+    console.log("[AZURE] Calling Azure Anthropic API...");
+    // console.log("Transformed request:", JSON.stringify(anthropicRequest, null, 2));
+
+    // Call Azure Anthropic API (always JSON)
+    const response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": CONFIG.AZURE_API_KEY,
+        "anthropic-version": CONFIG.ANTHROPIC_VERSION,
+      },
+      timeout: 120000,
+      responseType: "json",
+      validateStatus: (status) => status < 600,
+    });
+
+    console.log("[AZURE] Response status:", response.status);
+
+    // Handle Azure error responses
+    if (response.status >= 400) {
+      let errorMessage = "Azure API error";
+      let errorType = "api_error";
+
+      if (response.data) {
+        if (typeof response.data === "string") {
+          try {
+            const parsed = JSON.parse(response.data);
+            errorMessage = parsed?.error?.message || parsed?.message || errorMessage;
+            errorType = parsed?.error?.type || errorType;
+          } catch {
+            errorMessage = response.data;
+          }
+        } else if (response.data.error) {
+          errorMessage = response.data.error.message || errorMessage;
+          errorType = response.data.error.type || errorType;
+        } else if (response.data.message) {
+          errorMessage = response.data.message;
+        }
+      }
+
+      console.error("[ERROR] Azure returned error:", response.status, errorMessage);
+      console.error("[ERROR] Transformed request that failed:", JSON.stringify(anthropicRequest, null, 2));
+
+      return res.status(response.status).json({
+        error: { message: errorMessage, type: errorType, code: response.status },
+      });
+    }
+
+    // Transform response to OpenAI chat.completion JSON
+    try {
+      const openAIResponse = transformResponse(response.data);
+
+      // Cursor/provider tolerance hardening
+      const msg = openAIResponse?.choices?.[0]?.message;
+      if (msg && msg.content == null) msg.content = "";
+
+      if (openAIResponse?.choices?.[0] && msg?.tool_calls?.length) {
+        openAIResponse.choices[0].finish_reason = "tool_calls";
+      }
+
+      console.log("[RESPONSE] Sending response to client");
+      return res.json(openAIResponse);
+    } catch (transformError) {
+      console.error("[ERROR] Failed to transform response:", transformError);
+      console.error("[ERROR] Raw response data:", JSON.stringify(response.data));
+      return res.status(500).json({
+        error: {
+          message: "Failed to transform response: " + transformError.message,
+          type: "transform_error",
+        },
+      });
+    }
+  } catch (error) {
+    console.error("[ERROR] Exception in /v1/chat/completions:", error.message);
+
+    if (error.response) {
+      console.error("[ERROR] Azure API error:", error.response.status, error.response.statusText);
+      return res.status(error.response.status).json({
+        error: {
+          message: error.response.data?.error?.message || error.message,
+          type: error.response.data?.error?.type || "api_error",
+          code: error.response.status,
+        },
+      });
+    } else if (error.request) {
+      console.error("[ERROR] No response from Azure API");
+      return res.status(503).json({
+        error: {
+          message: "Unable to reach Azure Anthropic API: " + error.message,
+          type: "connection_error",
+        },
+      });
+    } else {
+      console.error("[ERROR] Request setup error:", error.message);
+      return res.status(500).json({
+        error: { message: error.message, type: "proxy_error" },
+      });
+    }
+  }
 });
+
 
 // Anthropic-native endpoint for direct compatibility
 app.post("/v1/messages", async (req, res) => {
