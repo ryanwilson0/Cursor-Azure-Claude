@@ -383,6 +383,7 @@ function transformAzureToOpenAI(azureResp, requestedModel) {
 function sendOpenAISSE(res, openAIResponse) {
   const choice = openAIResponse?.choices?.[0] || {};
   const message = choice.message || { role: "assistant", content: "" };
+
   const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
   const hasToolCalls = toolCalls.length > 0;
 
@@ -394,6 +395,7 @@ function sendOpenAISSE(res, openAIResponse) {
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // helps with some proxies
   res.flushHeaders?.();
 
   const writeChunk = (delta, finish_reason = null) => {
@@ -407,45 +409,71 @@ function sendOpenAISSE(res, openAIResponse) {
     res.write(`data: ${JSON.stringify(chunk)}\n\n`);
   };
 
-  // 1) role chunk
+  // 1) role chunk FIRST (Cursor expects early bytes)
   writeChunk({ role: "assistant" }, null);
 
-  // 2) content chunk (optionally split to avoid huge frames)
+  // 2) content chunk(s)
   const text = typeof message.content === "string" ? message.content : "";
   if (text.length) {
-    // Split into ~2000 char chunks (safer for clients)
-    const CHUNK = 2000;
+    const CHUNK = 1500;
     for (let i = 0; i < text.length; i += CHUNK) {
       writeChunk({ content: text.slice(i, i + CHUNK) }, null);
     }
   }
 
-  // 3) tool_calls chunk if present
+  // 3) tool_calls streamed in OpenAI incremental shape
   if (hasToolCalls) {
-    const streamed = toolCalls.map((tc, idx) => ({
-      index: idx,
-      id: tc.id,
-      type: tc.type || "function",
-      function: {
-        name: tc.function?.name,
-        arguments: tc.function?.arguments || "",
-      },
-    }));
+    const ARG_CHUNK = 1200;
 
-    // Send tool_calls as a delta
-    writeChunk({ tool_calls: streamed }, null);
+    for (let idx = 0; idx < toolCalls.length; idx++) {
+      const tc = toolCalls[idx];
+      const name = tc?.function?.name || "unknown_tool";
+      const args = tc?.function?.arguments || "";
+      const tcId = tc?.id || ("call_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10));
 
-    // Finish as tool_calls so Cursor executes them
+      // 3a) announce tool call (name + id) with empty args
+      writeChunk(
+        {
+          tool_calls: [
+            {
+              index: idx,
+              id: tcId,
+              type: "function",
+              function: { name, arguments: "" },
+            },
+          ],
+        },
+        null
+      );
+
+      // 3b) stream arguments in chunks (Cursor tends to require this)
+      for (let i = 0; i < args.length; i += ARG_CHUNK) {
+        writeChunk(
+          {
+            tool_calls: [
+              {
+                index: idx,
+                function: { arguments: args.slice(i, i + ARG_CHUNK) },
+              },
+            ],
+          },
+          null
+        );
+      }
+    }
+
+    // 3c) finish as tool_calls
     writeChunk({}, "tool_calls");
     res.write("data: [DONE]\n\n");
     return res.end();
   }
 
-  // Normal stop
+  // 4) normal stop
   writeChunk({}, "stop");
   res.write("data: [DONE]\n\n");
   return res.end();
 }
+
 
 // -------------------- Endpoints --------------------
 app.get("/", (req, res) => {
@@ -501,24 +529,70 @@ app.get("/models", requireAuth, (req, res) => {
 async function handleChatCompletions(req, res) {
   console.log("[REQUEST /chat/completions]", new Date().toISOString());
   console.log("Model:", req.body?.model, "Stream:", req.body?.stream);
+
   const toolsCount = Array.isArray(req.body?.tools) ? req.body.tools.length : 0;
   console.log("Tools present:", toolsCount);
-  console.log("Roles:", Array.isArray(req.body?.messages) ? req.body.messages.map((m) => m.role) : []);
+
+  const roles = Array.isArray(req.body?.messages) ? req.body.messages.map((m) => m.role) : [];
+  console.log("Roles:", roles);
+
+  const wantStream = req.body?.stream === true;
+
+  // We'll start SSE immediately when streaming is requested to avoid Cursor timeouts / buffering.
+  let heartbeat = null;
+  let sseStarted = false;
+
+  const sseWrite = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
   try {
     if (!CONFIG.AZURE_API_KEY) {
-      return res.status(500).json({ error: { message: "Azure API key not configured", type: "configuration_error" } });
+      return res.status(500).json({
+        error: { message: "Azure API key not configured", type: "configuration_error" },
+      });
     }
     if (!CONFIG.AZURE_ENDPOINT) {
-      return res.status(500).json({ error: { message: "Azure endpoint not configured", type: "configuration_error" } });
+      return res.status(500).json({
+        error: { message: "Azure endpoint not configured", type: "configuration_error" },
+      });
     }
     if (!req.body || !Array.isArray(req.body.messages)) {
-      return res.status(400).json({ error: { message: "Invalid request: expected messages[]", type: "invalid_request_error" } });
+      return res.status(400).json({
+        error: { message: "Invalid request: expected messages[]", type: "invalid_request_error" },
+      });
     }
 
-    const wantStream = req.body.stream === true;
+    // If Cursor requested streaming, open the stream immediately and keep it alive.
+    // Cursor will often show "Empty provider response" if it doesn't see early SSE bytes.
+    if (wantStream) {
+      res.status(200);
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no"); // helps with buffering proxies
+      res.flushHeaders?.();
 
-    // Always call Azure non-streaming. We do streaming to Cursor ourselves.
+      // Send an early "role" chunk so Cursor knows the provider is alive.
+      const earlyId = makeChatCmplId();
+      const created = Math.floor(Date.now() / 1000);
+      const model = req.body?.model || "claude-opus-4-5";
+
+      sseWrite({
+        id: earlyId,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+      });
+
+      // Heartbeat ping every 10s while we wait for Azure.
+      heartbeat = setInterval(() => {
+        res.write(":\n\n"); // SSE comment line
+      }, 10000);
+
+      sseStarted = true;
+    }
+
+    // Always call Azure non-streaming. We stream to Cursor ourselves.
     const reqForAzure = { ...req.body, stream: false };
 
     const anthropicRequest = transformRequestToAnthropic(reqForAzure);
@@ -541,24 +615,72 @@ async function handleChatCompletions(req, res) {
     if (response.status >= 400) {
       const msg = response.data?.error?.message || response.data?.message || "Azure API error";
       console.error("[ERROR] Azure error:", msg);
-      return res.status(response.status).json({ error: { message: msg, type: "api_error", code: response.status } });
+
+      if (heartbeat) clearInterval(heartbeat);
+
+      // If we already started SSE, return an SSE-shaped error so Cursor doesn't treat it as empty.
+      if (sseStarted) {
+        const created = Math.floor(Date.now() / 1000);
+        const model = req.body?.model || "claude-opus-4-5";
+        sseWrite({
+          id: makeChatCmplId(),
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta: { content: `Azure error: ${msg}` }, finish_reason: "stop" }],
+        });
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+
+      return res.status(response.status).json({
+        error: { message: msg, type: "api_error", code: response.status },
+      });
     }
 
     const openAIResponse = transformAzureToOpenAI(response.data, req.body?.model);
 
+    const fr = openAIResponse?.choices?.[0]?.finish_reason;
+    const tcCount = openAIResponse?.choices?.[0]?.message?.tool_calls?.length || 0;
+    console.log("[DEBUG] finish_reason:", fr, "tool_calls:", tcCount);
+
+    if (heartbeat) clearInterval(heartbeat);
+
+    // Non-streaming: return JSON
     if (!wantStream) {
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       console.log("[RESPONSE] Sending JSON response");
       return res.status(200).json(openAIResponse);
     }
 
+    // Streaming: stream OpenAI SSE chunks (must be Cursor-friendly)
     console.log("[RESPONSE] Sending SSE response");
     return sendOpenAISSE(res, openAIResponse);
   } catch (e) {
-    console.error("[ERROR] /chat/completions exception:", e?.message || e);
-    return res.status(500).json({ error: { message: e?.message || "proxy_error", type: "proxy_error" } });
+    const msg = e?.message || String(e);
+    console.error("[ERROR] /chat/completions exception:", msg);
+
+    if (heartbeat) clearInterval(heartbeat);
+
+    // If SSE is already open, send an SSE-shaped error + DONE
+    if (sseStarted) {
+      const created = Math.floor(Date.now() / 1000);
+      const model = req.body?.model || "claude-opus-4-5";
+      sseWrite({
+        id: makeChatCmplId(),
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [{ index: 0, delta: { content: `Proxy error: ${msg}` }, finish_reason: "stop" }],
+      });
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
+    return res.status(500).json({ error: { message: msg, type: "proxy_error" } });
   }
 }
+
 
 // Cursor uses this
 app.post("/chat/completions", requireAuth, handleChatCompletions);
