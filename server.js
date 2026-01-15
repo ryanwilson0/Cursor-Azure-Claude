@@ -190,6 +190,36 @@ function anthropicContentToOpenAIMessage(contentBlocks) {
     ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
   };
 }
+function safeJsonParse(s) {
+  if (typeof s !== "string" || !s.length) return {};
+  try { return JSON.parse(s); } catch { return {}; }
+}
+
+function openaiAssistantToAnthropicBlocks(msg) {
+  const blocks = [];
+
+  // Preserve any assistant text (if present)
+  if (msg.content != null) {
+    blocks.push(...toAnthropicContentBlocks(msg.content));
+  }
+
+  // Preserve tool calls as Anthropic tool_use blocks
+  if (Array.isArray(msg.tool_calls)) {
+    for (const tc of msg.tool_calls) {
+      const name = tc?.function?.name;
+      if (!name) continue;
+
+      blocks.push({
+        type: "tool_use",
+        id: tc.id || ("toolu_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)),
+        name,
+        input: safeJsonParse(tc?.function?.arguments || "{}"),
+      });
+    }
+  }
+
+  return blocks;
+}
 
 function transformRequest(openAIRequest) {
   const {
@@ -213,59 +243,37 @@ function transformRequest(openAIRequest) {
   if (messages && Array.isArray(messages)) {
     for (const msg of messages) {
       if (!msg) continue;
-
+  
       if (msg.role === "system") {
-        if (msg.content != null) {
-          systemTextParts.push(
-            typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
-          );
-        }
+        if (msg.content != null) systemTextParts.push(
+          typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
+        );
         continue;
       }
-
+  
+      // NEW: preserve assistant tool_calls history
+      if (msg.role === "assistant") {
+        anthropicMessages.push({
+          role: "assistant",
+          content: openaiAssistantToAnthropicBlocks(msg),
+        });
+        continue;
+      }
+  
       if (msg.role === "tool") {
         anthropicMessages.push(openaiToolMessageToAnthropicUserMessage(msg));
         continue;
       }
-
-      const roleMapped = msg.role === "assistant" ? "assistant" : "user";
+  
+      // user
       anthropicMessages.push({
-        role: roleMapped,
+        role: "user",
         content: toAnthropicContentBlocks(msg.content),
       });
     }
-  } else if (role && content) {
-    if (role === "system") systemTextParts.push(String(content));
-    else {
-      anthropicMessages = [
-        {
-          role: role === "assistant" ? "assistant" : "user",
-          content: toAnthropicContentBlocks(content),
-        },
-      ];
-    }
-  } else if (input) {
-    if (Array.isArray(input)) {
-      for (const msg of input) {
-        if (!msg) continue;
-        if (msg.role === "system") {
-          systemTextParts.push(String(msg.content ?? ""));
-          continue;
-        }
-        const roleMapped = msg.role === "assistant" ? "assistant" : "user";
-        anthropicMessages.push({
-          role: roleMapped,
-          content: toAnthropicContentBlocks(msg.content),
-        });
-      }
-    } else {
-      anthropicMessages = [{ role: user || "user", content: toAnthropicContentBlocks(input) }];
-    }
-  } else if (content != null) {
-    anthropicMessages = [{ role: "user", content: toAnthropicContentBlocks(content) }];
-  } else {
-    throw new Error("Invalid request format: missing messages, role/content, input, or content field");
   }
+
+
 
   if (!anthropicMessages.length) throw new Error("Invalid request: no valid messages found");
 
