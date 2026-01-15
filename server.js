@@ -51,6 +51,61 @@ const MODEL_NAMES_TO_MAP = [
   "claude-3-sonnet",
   "claude-3-haiku",
 ];
+function normalizeArgsForCursorTools(toolName, args) {
+  if (!args || typeof args !== "object") return args;
+
+  // Cursor tools commonly require `path`
+  if (args.path == null) {
+    if (args.file_path != null) {
+      args.path = args.file_path;
+      delete args.file_path;
+    } else if (args.filePath != null) {
+      args.path = args.filePath;
+      delete args.filePath;
+    } else if (args.filepath != null) {
+      args.path = args.filepath;
+      delete args.filepath;
+    } else if (args.filename != null) {
+      args.path = args.filename;
+      delete args.filename;
+    } else if (args.file != null) {
+      args.path = args.file;
+      delete args.file;
+    }
+  }
+
+  // Common line-range normalizations (harmless if Cursor ignores)
+  if (args.startLine != null && args.start_line == null) {
+    args.start_line = args.startLine;
+    delete args.startLine;
+  }
+  if (args.endLine != null && args.end_line == null) {
+    args.end_line = args.endLine;
+    delete args.endLine;
+  }
+
+  return args;
+}
+
+function normalizeToolCallsForCursor(toolCalls) {
+  return (toolCalls || []).map((tc) => {
+    const name = tc?.function?.name;
+    let argsObj = {};
+    try {
+      argsObj = JSON.parse(tc?.function?.arguments || "{}");
+    } catch {
+      argsObj = {};
+    }
+    argsObj = normalizeArgsForCursorTools(name, argsObj);
+    return {
+      ...tc,
+      function: {
+        ...tc.function,
+        arguments: JSON.stringify(argsObj),
+      },
+    };
+  });
+}
 
 function mapModelToDeployment(modelName) {
   if (!modelName) return CONFIG.AZURE_DEPLOYMENT_NAME;
@@ -724,7 +779,8 @@ async function handleChatCompletions(req, res) {
 
     const dbg = openAIResponse._debug || {};
     const msg0 = openAIResponse?.choices?.[0]?.message || { role: "assistant", content: "" };
-    const toolCalls = Array.isArray(msg0.tool_calls) ? msg0.tool_calls : [];
+    let toolCalls = Array.isArray(msg0.tool_calls) ? msg0.tool_calls : [];
+    toolCalls = normalizeToolCallsForCursor(toolCalls)
     const toolNames = toolCalls.map((tc) => tc?.function?.name).filter(Boolean);
 
     const contentStr = typeof msg0.content === "string" ? msg0.content : "";
