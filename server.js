@@ -7,128 +7,143 @@ app.use(express.json({ limit: "50mb" }));
 
 // Configuration - Lấy từ environment variables
 const CONFIG = {
-    AZURE_ENDPOINT: process.env.AZURE_ENDPOINT,
-    AZURE_API_KEY: process.env.AZURE_API_KEY,
-    SERVICE_API_KEY: process.env.SERVICE_API_KEY,
-    PORT: process.env.PORT || 8080,
-    ANTHROPIC_VERSION: "2023-06-01",
-    // Default Azure deployment name (can be overridden via AZURE_DEPLOYMENT_NAME)
-    AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || "claude-opus-4-5",
+  AZURE_ENDPOINT: process.env.AZURE_ENDPOINT,
+  AZURE_API_KEY: process.env.AZURE_API_KEY,
+  SERVICE_API_KEY: process.env.SERVICE_API_KEY,
+  PORT: process.env.PORT || 8080,
+  ANTHROPIC_VERSION: "2023-06-01",
+  // Default Azure deployment name (can be overridden via AZURE_DEPLOYMENT_NAME)
+  AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || "claude-opus-4-5",
 };
 
 // Model name mapping: common model names that should be mapped to Azure deployment
 // The actual deployment name is determined by AZURE_DEPLOYMENT_NAME env var
-const MODEL_NAMES_TO_MAP = ["gpt-4", "gpt-4.1", "gpt-4o", "claude-opus-4-5", "claude-4.5-opus-high", "claude-4-opus", "claude-3-opus", "claude-3-sonnet", "claude-3-haiku"];
+const MODEL_NAMES_TO_MAP = [
+  "gpt-4",
+  "gpt-4.1",
+  "gpt-4o",
+  "claude-opus-4-5",
+  "claude-4.5-opus-high",
+  "claude-4-opus",
+  "claude-3-opus",
+  "claude-3-sonnet",
+  "claude-3-haiku",
+];
 
 // Function to map model name to Azure deployment name
 function mapModelToDeployment(modelName) {
-    if (!modelName) {
-        return CONFIG.AZURE_DEPLOYMENT_NAME;
-    }
+  if (!modelName) {
+    return CONFIG.AZURE_DEPLOYMENT_NAME;
+  }
 
-    // If the model name is in our mapping list, use the configured deployment name
-    if (MODEL_NAMES_TO_MAP.includes(modelName)) {
-        return CONFIG.AZURE_DEPLOYMENT_NAME;
-    }
+  // If the model name is in our mapping list, use the configured deployment name
+  if (MODEL_NAMES_TO_MAP.includes(modelName)) {
+    return CONFIG.AZURE_DEPLOYMENT_NAME;
+  }
 
-    // If AZURE_DEPLOYMENT_NAME is explicitly set (not the default), use it for all models
-    if (process.env.AZURE_DEPLOYMENT_NAME) {
-        return CONFIG.AZURE_DEPLOYMENT_NAME;
-    }
+  // If AZURE_DEPLOYMENT_NAME is explicitly set (not the default), use it for all models
+  if (process.env.AZURE_DEPLOYMENT_NAME) {
+    return CONFIG.AZURE_DEPLOYMENT_NAME;
+  }
 
-    // Otherwise, use the model name as-is (in case it's already the deployment name)
-    return modelName;
+  // Otherwise, use the model name as-is (in case it's already the deployment name)
+  return modelName;
 }
 
 // CORS middleware
 app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version");
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, x-api-key, anthropic-version"
+  );
 
-    if (req.method === "OPTIONS") {
-        return res.sendStatus(200);
-    }
-    next();
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
 });
 
 // Log all requests
 app.use((req, res, next) => {
-    console.log(`[${req.method}] ${req.path}`);
-    // Only log headers in development or when needed for debugging
-    // console.log('Headers:', JSON.stringify(req.headers, null, 2));
-    next();
+  console.log(`[${req.method}] ${req.path}`);
+  next();
 });
 
 // Authentication middleware - Validate bearer token from Cursor IDE
 function requireAuth(req, res, next) {
-    // Skip authentication for OPTIONS requests and health check
-    if (req.method === "OPTIONS" || req.path === "/health" || req.path === "/") {
-        return next();
-    }
+  // Skip authentication for OPTIONS requests and health check
+  if (req.method === "OPTIONS" || req.path === "/health" || req.path === "/") {
+    return next();
+  }
 
-    // Check if SERVICE_API_KEY is configured
-    if (!CONFIG.SERVICE_API_KEY) {
-        console.error("[ERROR] SERVICE_API_KEY not configured");
-        return res.status(500).json({
-            error: {
-                message: "SERVICE_API_KEY not configured",
-                type: "configuration_error",
-            },
-        });
-    }
+  // Check if SERVICE_API_KEY is configured
+  if (!CONFIG.SERVICE_API_KEY) {
+    console.error("[ERROR] SERVICE_API_KEY not configured");
+    return res.status(500).json({
+      error: {
+        message: "SERVICE_API_KEY not configured",
+        type: "configuration_error",
+      },
+    });
+  }
 
-    // Extract bearer token from Authorization header
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
-        console.error("[ERROR] Missing Authorization header");
-        return res.status(401).json({
-            error: {
-                message: "Authentication with Cursor-Azure-Claude-Proxy service failed.\n\n" +
-                    "These value of:\n" +
-                    "\tCursor Settings > Models > API Keys > OpenAI API Key\n\n" +
-                    "Must match the value of:\n" +
-                    "\tSERVICE_API_KEY in your .env file\n\n" +
-                    "Ensure the values match exactly, and try again.\n" +
-                    "If modifying the .env file, restart the service for the changes to apply.",
-                type: "authentication_error",
-            },
-        });
-    }
+  // Extract bearer token from Authorization header
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    console.error("[ERROR] Missing Authorization header");
+    return res.status(401).json({
+      error: {
+        message:
+          "Authentication with Cursor-Azure-Claude-Proxy service failed.\n\n" +
+          "These value of:\n" +
+          "\tCursor Settings > Models > API Keys > OpenAI API Key\n\n" +
+          "Must match the value of:\n" +
+          "\tSERVICE_API_KEY in your .env file\n\n" +
+          "Ensure the values match exactly, and try again.\n" +
+          "If modifying the .env file, restart the service for the changes to apply.",
+        type: "authentication_error",
+      },
+    });
+  }
 
-    // Parse bearer token (format: "Bearer <token>" or just "<token>")
-    let token = authHeader;
-    if (authHeader.startsWith("Bearer ")) {
-        token = authHeader.substring(7);
-    }
+  // Parse bearer token (format: "Bearer <token>" or just "<token>")
+  let token = authHeader;
+  if (authHeader.startsWith("Bearer ")) {
+    token = authHeader.substring(7);
+  }
 
-    // Validate token matches SERVICE_API_KEY
-    if (token !== CONFIG.SERVICE_API_KEY) {
-        console.error("[ERROR] Invalid API key provided");
-        return res.status(401).json({
-            error: {
-                message: "Authentication with Cursor-Azure-Claude-Proxy service failed.\n\n" +
-                    "These value of:\n" +
-                    "\tCursor Settings > Models > API Keys > OpenAI API Key\n\n" +
-                    "Must match the value of:\n" +
-                    "\tSERVICE_API_KEY in your .env file\n\n" +
-                    "Ensure the values match exactly, and try again.\n" +
-                    "If modifying the .env file, restart the service for the changes to apply.",
-                type: "authentication_error",
-            },
-        });
-    }
+  // Validate token matches SERVICE_API_KEY
+  if (token !== CONFIG.SERVICE_API_KEY) {
+    console.error("[ERROR] Invalid API key provided");
+    return res.status(401).json({
+      error: {
+        message:
+          "Authentication with Cursor-Azure-Claude-Proxy service failed.\n\n" +
+          "These value of:\n" +
+          "\tCursor Settings > Models > API Keys > OpenAI API Key\n\n" +
+          "Must match the value of:\n" +
+          "\tSERVICE_API_KEY in your .env file\n\n" +
+          "Ensure the values match exactly, and try again.\n" +
+          "If modifying the .env file, restart the service for the changes to apply.",
+        type: "authentication_error",
+      },
+    });
+  }
 
-    // Authentication successful
-    next();
+  // Authentication successful
+  next();
 }
+
+// ---------- OpenAI <-> Anthropic helpers ----------
+
 function toAnthropicContentBlocks(content) {
   // Anthropic "messages" expects content as an array of blocks or a string.
-  // We normalize to blocks to make tool_result handling consistent.
+  // Normalize to blocks so tool_result handling is consistent.
   if (Array.isArray(content)) return content;
   if (typeof content === "string") return [{ type: "text", text: content }];
   if (content == null) return [];
-  // Fallback: stringify objects
   return [{ type: "text", text: String(content) }];
 }
 
@@ -136,8 +151,8 @@ function openaiToolsToAnthropic(tools = []) {
   // OpenAI tools: [{type:"function", function:{name, description, parameters}}]
   // Anthropic tools: [{name, description, input_schema}]
   return (tools || [])
-    .filter(t => t?.type === "function" && t.function?.name)
-    .map(t => ({
+    .filter((t) => t?.type === "function" && t.function?.name)
+    .map((t) => ({
       name: t.function.name,
       description: t.function.description || "",
       input_schema: t.function.parameters || { type: "object", properties: {} },
@@ -145,14 +160,13 @@ function openaiToolsToAnthropic(tools = []) {
 }
 
 function openaiToolMessageToAnthropicUserMessage(msg) {
-  // OpenAI tool message usually looks like:
+  // OpenAI tool message:
   // { role:"tool", tool_call_id:"...", content:"..." }
   const toolUseId = msg.tool_call_id || msg.tool_callId || msg.id;
   const resultText =
     typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
 
   if (!toolUseId) {
-    // If we can't link to a tool_use id, treat as plain user text fallback.
     return { role: "user", content: toAnthropicContentBlocks(resultText) };
   }
 
@@ -177,7 +191,7 @@ function anthropicContentToOpenAIMessage(contentBlocks) {
       if (typeof b.text === "string") textParts.push(b.text);
     } else if (b?.type === "tool_use") {
       toolCalls.push({
-        id: b.id, // IMPORTANT: preserve Anthropic tool_use id
+        id: b.id, // preserve Anthropic tool_use id
         type: "function",
         function: {
           name: b.name,
@@ -189,7 +203,8 @@ function anthropicContentToOpenAIMessage(contentBlocks) {
 
   const msg = {
     role: "assistant",
-    content: textParts.length ? textParts.join("") : "",
+    // IMPORTANT: if no text, keep null (OpenAI tool-call convention)
+    content: textParts.length ? textParts.join("") : null,
   };
 
   if (toolCalls.length) msg.tool_calls = toolCalls;
@@ -204,8 +219,8 @@ function transformRequest(openAIRequest) {
     max_tokens,
     temperature,
     stream,
-    tools,          // <-- NEW
-    tool_choice,    // <-- optional; ignore if unsupported
+    tools,
+    tool_choice, // unused
     role,
     content,
     input,
@@ -216,15 +231,15 @@ function transformRequest(openAIRequest) {
   let anthropicMessages = [];
   let systemTextParts = [];
 
-  // Build messages from OpenAI messages[]
   if (messages && Array.isArray(messages)) {
     for (const msg of messages) {
       if (!msg) continue;
 
       if (msg.role === "system") {
-        if (msg.content != null) systemTextParts.push(
-          typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
-        );
+        if (msg.content != null)
+          systemTextParts.push(
+            typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
+          );
         continue;
       }
 
@@ -241,7 +256,13 @@ function transformRequest(openAIRequest) {
     }
   } else if (role && content) {
     if (role === "system") systemTextParts.push(String(content));
-    else anthropicMessages = [{ role: role === "assistant" ? "assistant" : "user", content: toAnthropicContentBlocks(content) }];
+    else
+      anthropicMessages = [
+        {
+          role: role === "assistant" ? "assistant" : "user",
+          content: toAnthropicContentBlocks(content),
+        },
+      ];
   } else if (input) {
     if (Array.isArray(input)) {
       for (const msg of input) {
@@ -257,12 +278,16 @@ function transformRequest(openAIRequest) {
         });
       }
     } else {
-      anthropicMessages = [{ role: user || "user", content: toAnthropicContentBlocks(input) }];
+      anthropicMessages = [
+        { role: user || "user", content: toAnthropicContentBlocks(input) },
+      ];
     }
   } else if (content != null) {
     anthropicMessages = [{ role: "user", content: toAnthropicContentBlocks(content) }];
   } else {
-    throw new Error("Invalid request format: missing messages, role/content, input, or content field");
+    throw new Error(
+      "Invalid request format: missing messages, role/content, input, or content field"
+    );
   }
 
   if (!anthropicMessages.length) throw new Error("Invalid request: no valid messages found");
@@ -283,14 +308,12 @@ function transformRequest(openAIRequest) {
 
   if (temperature !== undefined) anthropicRequest.temperature = temperature;
 
-  // NOTE: We'll handle streaming in Step 4 below (tools + streaming is trickier)
+  // We will force stream=false when calling Azure from handlers
   if (stream !== undefined) anthropicRequest.stream = stream;
 
   // Pass through tools (OpenAI -> Anthropic)
   const anthTools = openaiToolsToAnthropic(tools);
   if (anthTools.length) anthropicRequest.tools = anthTools;
-
-
 
   const supportedFields = ["metadata", "stop_sequences", "top_p", "top_k"];
   for (const field of supportedFields) {
@@ -302,7 +325,6 @@ function transformRequest(openAIRequest) {
 
 function mapFinishReason(stopReason) {
   // Anthropic -> OpenAI normalization
-  // Common Anthropic stop_reason values: "end_turn", "max_tokens", "tool_use", "stop_sequence"
   switch (stopReason) {
     case "end_turn":
     case "stop_sequence":
@@ -324,11 +346,12 @@ function transformResponse(anthropicResponse, requestedModel) {
   const { content, stop_reason, usage } = anthropicResponse;
 
   const assistantMessage = anthropicContentToOpenAIMessage(content);
+  const hasToolCalls =
+    Array.isArray(assistantMessage.tool_calls) && assistantMessage.tool_calls.length > 0;
 
-  // Cursor tolerance: avoid null content
-  if (assistantMessage.content == null) assistantMessage.content = "";
-
-  const hasToolCalls = Array.isArray(assistantMessage.tool_calls) && assistantMessage.tool_calls.length > 0;
+  // IMPORTANT: tool_calls => content must be null (or omitted). Do not coerce to "".
+  if (hasToolCalls) assistantMessage.content = null;
+  else if (assistantMessage.content == null) assistantMessage.content = "";
 
   return {
     id: makeChatCmplId(),
@@ -351,58 +374,66 @@ function transformResponse(anthropicResponse, requestedModel) {
   };
 }
 
-
+// ---------- Basic endpoints ----------
 
 // Root endpoint
 app.get("/", (req, res) => {
-    console.log("[INFO] Root endpoint accessed");
-    res.json({
-        status: "running",
-        name: "Azure Anthropic Proxy for Cursor",
-        version: "1.0.0",
-        endpoints: {
-            health: "/health",
-            chat_cursor: "/chat/completions",
-            chat_openai: "/v1/chat/completions",
-            chat_anthropic: "/v1/messages",
-        },
-        config: {
-            apiKeyConfigured: !!CONFIG.AZURE_API_KEY
-        },
-    });
+  console.log("[INFO] Root endpoint accessed");
+  res.json({
+    status: "running",
+    name: "Azure Anthropic Proxy for Cursor",
+    version: "1.0.0",
+    endpoints: {
+      health: "/health",
+      chat_cursor: "/chat/completions",
+      chat_openai: "/v1/chat/completions",
+      chat_anthropic: "/v1/messages",
+    },
+    config: {
+      apiKeyConfigured: !!CONFIG.AZURE_API_KEY,
+    },
+  });
 });
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-    console.log("[HEALTH] Health check requested");
-    res.json({
-        status: "ok",
-        timestamp: new Date().toISOString(),
-        apiKeyConfigured: !!CONFIG.AZURE_API_KEY,
-        port: CONFIG.PORT,
-    });
+  console.log("[HEALTH] Health check requested");
+  res.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    apiKeyConfigured: !!CONFIG.AZURE_API_KEY,
+    port: CONFIG.PORT,
+  });
 });
 
-app.post("/chat/completions", requireAuth, async (req, res) => {
+// ---------- Shared OpenAI chat handler (used by /chat/completions and /v1/chat/completions) ----------
+
+async function handleChatCompletions(req, res) {
   console.log("[REQUEST /chat/completions]", new Date().toISOString());
   console.log("Model:", req.body?.model, "Stream:", req.body?.stream);
 
   const toolsCount = Array.isArray(req.body?.tools) ? req.body.tools.length : 0;
   console.log("Tools present:", toolsCount);
-  console.log("Roles:", Array.isArray(req.body?.messages) ? req.body.messages.map(m => m.role) : []);
+  console.log("Roles:", Array.isArray(req.body?.messages) ? req.body.messages.map((m) => m.role) : []);
 
   try {
     if (!CONFIG.AZURE_API_KEY) {
       console.error("[ERROR] Azure API key not configured");
-      return res.status(500).json({ error: { message: "Azure API key not configured", type: "configuration_error" } });
+      return res
+        .status(500)
+        .json({ error: { message: "Azure API key not configured", type: "configuration_error" } });
     }
     if (!CONFIG.AZURE_ENDPOINT) {
       console.error("[ERROR] Azure endpoint not configured");
-      return res.status(500).json({ error: { message: "Azure endpoint not configured", type: "configuration_error" } });
+      return res
+        .status(500)
+        .json({ error: { message: "Azure endpoint not configured", type: "configuration_error" } });
     }
     if (!req.body) {
       console.error("[ERROR] Empty request body");
-      return res.status(400).json({ error: { message: "Invalid request: empty body", type: "invalid_request_error" } });
+      return res
+        .status(400)
+        .json({ error: { message: "Invalid request: empty body", type: "invalid_request_error" } });
     }
 
     // Validate request has something transformable
@@ -423,7 +454,7 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
 
     const wantStream = req.body.stream === true;
 
-    // IMPORTANT: always call Azure non-streaming
+    // Always call Azure non-streaming; we will wrap into SSE if Cursor requested streaming
     const reqForAzure = { ...req.body, stream: false };
 
     let anthropicRequest;
@@ -457,19 +488,23 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
       return res.status(response.status).json({ error: { message: msg, type: "api_error", code: response.status } });
     }
 
-    // Build OpenAI response JSON
+    // OpenAI response JSON
     const openAIResponse = transformResponse(response.data, req.body?.model);
 
     const choice = openAIResponse?.choices?.[0] || {};
-    const message = choice.message || { role: "assistant", content: "" };
-
-    // Hardening: never null content
-    if (message.content == null) message.content = "";
-
+    const message = choice.message || { role: "assistant" };
     const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
     const hasToolCalls = toolCalls.length > 0;
 
-    // If client did NOT request streaming, return JSON
+    // Ensure OpenAI semantics: tool_calls => content null
+    if (hasToolCalls) {
+      message.content = null;
+      choice.finish_reason = "tool_calls";
+    } else {
+      if (message.content == null) message.content = "";
+      if (!choice.finish_reason) choice.finish_reason = "stop";
+    }
+
     if (!wantStream) {
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       console.log("[RESPONSE] Sending JSON response");
@@ -479,7 +514,7 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
     // ---- Streaming SSE response (OpenAI-compatible) ----
     console.log("[RESPONSE] Sending SSE response");
 
-    const id = openAIResponse.id || ("chatcmpl-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10));
+    const id = openAIResponse.id || makeChatCmplId();
     const created = openAIResponse.created || Math.floor(Date.now() / 1000);
     const model = openAIResponse.model || (req.body?.model || "claude-opus-4-5");
 
@@ -500,28 +535,52 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     };
 
-    // 1) Initial role chunk (many clients expect this)
+    // 1) Initial role chunk
     send({ role: "assistant" }, null);
 
-    // 2) If there is assistant text, stream it
-    if (typeof message.content === "string" && message.content.length) {
-      send({ content: message.content }, null);
-    }
-
-    // 3) If there are tool calls, stream them as delta.tool_calls
-    // OpenAI streaming uses tool_calls with an "index" per call
+    // 2) Tool calls path: do NOT stream content; stream tool_calls as deltas
     if (hasToolCalls) {
-      const streamedToolCalls = toolCalls.map((tc, idx) => ({
-        index: idx,
-        id: tc.id,
-        type: tc.type || "function",
-        function: {
-          name: tc.function?.name,
-          arguments: tc.function?.arguments || "",
-        },
-      }));
+      console.log(
+        "Proxy response tool_calls:",
+        toolCalls.map((t) => t.function?.name)
+      );
 
-      send({ tool_calls: streamedToolCalls }, null);
+      for (let i = 0; i < toolCalls.length; i++) {
+        const tc = toolCalls[i];
+
+        // chunk A: announce tool call with name
+        send(
+          {
+            tool_calls: [
+              {
+                index: i,
+                id: tc.id,
+                type: tc.type || "function",
+                function: {
+                  name: tc.function?.name || "",
+                  arguments: "",
+                },
+              },
+            ],
+          },
+          null
+        );
+
+        // chunk B: provide arguments
+        send(
+          {
+            tool_calls: [
+              {
+                index: i,
+                function: {
+                  arguments: tc.function?.arguments || "",
+                },
+              },
+            ],
+          },
+          null
+        );
+      }
 
       // finish as tool_calls so Cursor executes them
       send({}, "tool_calls");
@@ -529,7 +588,11 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
       return res.end();
     }
 
-    // Otherwise normal stop
+    // 3) Normal text path: stream content (single chunk)
+    if (typeof message.content === "string" && message.content.length) {
+      send({ content: message.content }, null);
+    }
+
     send({}, "stop");
     res.write("data: [DONE]\n\n");
     return res.end();
@@ -537,185 +600,170 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
     console.error("[ERROR] Exception in /chat/completions:", error.message);
     return res.status(500).json({ error: { message: error.message, type: "proxy_error" } });
   }
-});
+}
 
+// Cursor uses this
+app.post("/chat/completions", requireAuth, handleChatCompletions);
 
+// Some clients use this
+app.post("/v1/chat/completions", requireAuth, handleChatCompletions);
 
-app.post("/v1/chat/completions", requireAuth, (req, res) => {
-  res.redirect(307, "/chat/completions");
-});
+// ---------- Anthropic-native endpoint for direct compatibility ----------
 
-// Anthropic-native endpoint for direct compatibility
 app.post("/v1/messages", async (req, res) => {
-    console.log("[REQUEST /v1/messages]", new Date().toISOString());
-    console.log("Body:", JSON.stringify(req.body, null, 2));
+  console.log("[REQUEST /v1/messages]", new Date().toISOString());
+  console.log("Body:", JSON.stringify(req.body, null, 2));
 
-    try {
-        // Validate API key
-        if (!CONFIG.AZURE_API_KEY) {
-            console.error("[ERROR] Azure API key not configured");
-            throw new Error("Azure API key not configured");
-        }
-
-        const isStreaming = req.body.stream === true;
-        console.log(`[AZURE] Calling Azure Anthropic API... (streaming: ${isStreaming})`);
-
-        // Call Azure Anthropic API
-        const response = await axios.post(CONFIG.AZURE_ENDPOINT, req.body, {
-            headers: {
-                "Content-Type": "application/json",
-                "x-api-key": CONFIG.AZURE_API_KEY,
-                "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
-            },
-            timeout: 120000,
-            responseType: isStreaming ? "stream" : "json",
-        });
-
-        if (isStreaming) {
-            // Set headers for SSE streaming
-            res.setHeader("Content-Type", "text/event-stream");
-            res.setHeader("Cache-Control", "no-cache");
-            res.setHeader("Connection", "keep-alive");
-
-            console.log("[AZURE] Streaming response...");
-
-            // Pipe the stream directly to response
-            response.data.pipe(res);
-
-            response.data.on("end", () => {
-                console.log("[AZURE] Stream ended");
-            });
-
-            response.data.on("error", (error) => {
-                console.error("[ERROR] Stream error:", error);
-                if (!res.headersSent) {
-                    res.status(500).json({
-                        error: {
-                            message: "Streaming error",
-                            type: "stream_error",
-                        },
-                    });
-                }
-            });
-        } else {
-            console.log("[AZURE] Response received successfully");
-            // Return Anthropic response directly
-            res.json(response.data);
-        }
-    } catch (error) {
-        console.error("[ERROR]", error.message);
-
-        if (error.response) {
-            console.error("[ERROR] Azure API error:", {
-                status: error.response.status,
-                data: error.response.data,
-            });
-
-            res.status(error.response.status).json(error.response.data);
-        } else if (error.request) {
-            console.error("[ERROR] No response from Azure API");
-            res.status(503).json({
-                error: {
-                    message: "Unable to reach Azure Anthropic API",
-                    type: "connection_error",
-                },
-            });
-        } else {
-            console.error("[ERROR] Request setup error");
-            res.status(500).json({
-                error: {
-                    message: error.message,
-                    type: "proxy_error",
-                },
-            });
-        }
+  try {
+    if (!CONFIG.AZURE_API_KEY) {
+      console.error("[ERROR] Azure API key not configured");
+      throw new Error("Azure API key not configured");
     }
+
+    const isStreaming = req.body.stream === true;
+    console.log(`[AZURE] Calling Azure Anthropic API... (streaming: ${isStreaming})`);
+
+    const response = await axios.post(CONFIG.AZURE_ENDPOINT, req.body, {
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": CONFIG.AZURE_API_KEY,
+        "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
+      },
+      timeout: 120000,
+      responseType: isStreaming ? "stream" : "json",
+      validateStatus: (s) => s < 600,
+    });
+
+    if (response.status >= 400) {
+      return res.status(response.status).json(response.data);
+    }
+
+    if (isStreaming) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      response.data.pipe(res);
+      response.data.on("end", () => console.log("[AZURE] Stream ended"));
+      response.data.on("error", (error) => {
+        console.error("[ERROR] Stream error:", error);
+        if (!res.headersSent) {
+          res.status(500).json({ error: { message: "Streaming error", type: "stream_error" } });
+        }
+      });
+    } else {
+      res.json(response.data);
+    }
+  } catch (error) {
+    console.error("[ERROR]", error.message);
+
+    if (error.response) {
+      res.status(error.response.status).json(error.response.data);
+    } else if (error.request) {
+      res.status(503).json({ error: { message: "Unable to reach Azure Anthropic API", type: "connection_error" } });
+    } else {
+      res.status(500).json({ error: { message: error.message, type: "proxy_error" } });
+    }
+  }
 });
+
+// ---------- Catch-alls ----------
 
 // Catch-all for any Anthropic API requests
 app.all("/anthropic/*", async (req, res) => {
-    console.log("[CATCH-ALL /anthropic/*]", req.method, req.path);
+  console.log("[CATCH-ALL /anthropic/*]", req.method, req.path);
 
-    try {
-        if (!CONFIG.AZURE_API_KEY) {
-            throw new Error("Azure API key not configured");
-        }
-
-        const isStreaming = req.body?.stream === true;
-
-        const response = await axios({
-            method: req.method,
-            url: CONFIG.AZURE_ENDPOINT,
-            data: req.body,
-            headers: {
-                "Content-Type": "application/json",
-                "x-api-key": CONFIG.AZURE_API_KEY,
-                "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
-            },
-            timeout: 120000,
-            responseType: isStreaming ? "stream" : "json",
-        });
-
-        if (isStreaming) {
-            res.setHeader("Content-Type", "text/event-stream");
-            res.setHeader("Cache-Control", "no-cache");
-            res.setHeader("Connection", "keep-alive");
-            response.data.pipe(res);
-        } else {
-            res.json(response.data);
-        }
-    } catch (error) {
-        console.error("[ERROR /anthropic/*]", error.message);
-        res.status(error.response?.status || 500).json({
-            error: {
-                message: error.message,
-                type: "proxy_error",
-            },
-        });
+  try {
+    if (!CONFIG.AZURE_API_KEY) {
+      throw new Error("Azure API key not configured");
     }
+
+    const isStreaming = req.body?.stream === true;
+
+    const response = await axios({
+      method: req.method,
+      url: CONFIG.AZURE_ENDPOINT,
+      data: req.body,
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": CONFIG.AZURE_API_KEY,
+        "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
+      },
+      timeout: 120000,
+      responseType: isStreaming ? "stream" : "json",
+      validateStatus: (s) => s < 600,
+    });
+
+    if (response.status >= 400) {
+      return res.status(response.status).json(response.data);
+    }
+
+    if (isStreaming) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      response.data.pipe(res);
+    } else {
+      res.json(response.data);
+    }
+  } catch (error) {
+    console.error("[ERROR /anthropic/*]", error.message);
+    res.status(error.response?.status || 500).json({
+      error: {
+        message: error.message,
+        type: "proxy_error",
+      },
+    });
+  }
 });
 
-// Catch-all for root /v1/* Anthropic-style requests
+// Catch-all for root /v1/* Anthropic-style requests (POST only)
 app.post("/v1/*", async (req, res) => {
-    console.log("[CATCH-ALL /v1/*]", req.path);
-    console.log("This request did not match specific handlers, proxying to Azure...");
+  console.log("[CATCH-ALL /v1/*]", req.path);
+  console.log("This request did not match specific handlers, proxying to Azure...");
 
-    try {
-        if (!CONFIG.AZURE_API_KEY) {
-            throw new Error("Azure API key not configured");
-        }
-
-        const isStreaming = req.body?.stream === true;
-
-        const response = await axios.post(CONFIG.AZURE_ENDPOINT, req.body, {
-            headers: {
-                "Content-Type": "application/json",
-                "x-api-key": CONFIG.AZURE_API_KEY,
-                "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
-            },
-            timeout: 120000,
-            responseType: isStreaming ? "stream" : "json",
-        });
-
-        if (isStreaming) {
-            res.setHeader("Content-Type", "text/event-stream");
-            res.setHeader("Cache-Control", "no-cache");
-            res.setHeader("Connection", "keep-alive");
-            response.data.pipe(res);
-        } else {
-            res.json(response.data);
-        }
-    } catch (error) {
-        console.error("[ERROR /v1/*]", error.message);
-        res.status(error.response?.status || 500).json({
-            error: {
-                message: error.message,
-                type: "proxy_error",
-            },
-        });
+  try {
+    if (!CONFIG.AZURE_API_KEY) {
+      throw new Error("Azure API key not configured");
     }
+
+    const isStreaming = req.body?.stream === true;
+
+    const response = await axios.post(CONFIG.AZURE_ENDPOINT, req.body, {
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": CONFIG.AZURE_API_KEY,
+        "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
+      },
+      timeout: 120000,
+      responseType: isStreaming ? "stream" : "json",
+      validateStatus: (s) => s < 600,
+    });
+
+    if (response.status >= 400) {
+      return res.status(response.status).json(response.data);
+    }
+
+    if (isStreaming) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      response.data.pipe(res);
+    } else {
+      res.json(response.data);
+    }
+  } catch (error) {
+    console.error("[ERROR /v1/*]", error.message);
+    res.status(error.response?.status || 500).json({
+      error: {
+        message: error.message,
+        type: "proxy_error",
+      },
+    });
+  }
 });
-// OpenAI-compatible models endpoints (Cursor often calls this to validate provider)
+
+// ---------- OpenAI-compatible models endpoints (Cursor often calls this) ----------
+
 app.get("/v1/models", requireAuth, (req, res) => {
   const now = Math.floor(Date.now() / 1000);
   res.json({
@@ -748,48 +796,49 @@ app.get("/models", requireAuth, (req, res) => {
 
 // 404 handler
 app.use((req, res) => {
-    console.log("[404] Route not found:", req.method, req.path);
-    res.status(404).json({
-        error: {
-            message: "Endpoint not found. Available endpoints: GET /, GET /health, POST /chat/completions, POST /v1/chat/completions, POST /v1/messages",
-            type: "not_found",
-        },
-    });
+  console.log("[404] Route not found:", req.method, req.path);
+  res.status(404).json({
+    error: {
+      message:
+        "Endpoint not found. Available endpoints: GET /, GET /health, POST /chat/completions, POST /v1/chat/completions, POST /v1/messages",
+      type: "not_found",
+    },
+  });
 });
 
 // Start server
 const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
-    console.log("\n" + "=".repeat(80));
-    console.log("🚀 Azure Anthropic Proxy - Railway Deployment");
-    console.log("=".repeat(80));
-    console.log(`📍 Server listening on: 0.0.0.0:${CONFIG.PORT}`);
-    console.log(`🔑 API Key configured: ${CONFIG.AZURE_API_KEY ? "✅ Yes" : "❌ No - Set AZURE_API_KEY env var!"}`);
-    console.log(`📊 Health check: /health`);
-    console.log(`💬 Chat endpoints:`);
-    console.log(`   - Cursor: /chat/completions`);
-    console.log(`   - OpenAI format: /v1/chat/completions`);
-    console.log(`   - Anthropic format: /v1/messages`);
-    console.log("=".repeat(80) + "\n");
+  console.log("\n" + "=".repeat(80));
+  console.log("🚀 Azure Anthropic Proxy - Railway Deployment");
+  console.log("=".repeat(80));
+  console.log(`📍 Server listening on: 0.0.0.0:${CONFIG.PORT}`);
+  console.log(`🔑 API Key configured: ${CONFIG.AZURE_API_KEY ? "✅ Yes" : "❌ No - Set AZURE_API_KEY env var!"}`);
+  console.log(`📊 Health check: /health`);
+  console.log(`💬 Chat endpoints:`);
+  console.log(`   - Cursor: /chat/completions`);
+  console.log(`   - OpenAI format: /v1/chat/completions`);
+  console.log(`   - Anthropic format: /v1/messages`);
+  console.log("=".repeat(80) + "\n");
 
-    if (!CONFIG.AZURE_API_KEY) {
-        console.error("⚠️  WARNING: AZURE_API_KEY environment variable is not set!");
-        console.error("⚠️  The server will not work until you configure this in Railway settings.\n");
-    }
+  if (!CONFIG.AZURE_API_KEY) {
+    console.error("⚠️  WARNING: AZURE_API_KEY environment variable is not set!");
+    console.error("⚠️  The server will not work until you configure this in Railway settings.\n");
+  }
 });
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
-    console.log("\n👋 SIGTERM received. Shutting down gracefully...");
-    server.close(() => {
-        console.log("✅ Server closed");
-        process.exit(0);
-    });
+  console.log("\n👋 SIGTERM received. Shutting down gracefully...");
+  server.close(() => {
+    console.log("✅ Server closed");
+    process.exit(0);
+  });
 });
 
 process.on("SIGINT", () => {
-    console.log("\n👋 SIGINT received. Shutting down gracefully...");
-    server.close(() => {
-        console.log("✅ Server closed");
-        process.exit(0);
-    });
+  console.log("\n👋 SIGINT received. Shutting down gracefully...");
+  server.close(() => {
+    console.log("✅ Server closed");
+    process.exit(0);
+  });
 });
