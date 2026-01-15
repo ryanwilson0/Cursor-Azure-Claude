@@ -122,6 +122,80 @@ function requireAuth(req, res, next) {
     // Authentication successful
     next();
 }
+function toAnthropicContentBlocks(content) {
+  // Anthropic "messages" expects content as an array of blocks or a string.
+  // We normalize to blocks to make tool_result handling consistent.
+  if (Array.isArray(content)) return content;
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (content == null) return [];
+  // Fallback: stringify objects
+  return [{ type: "text", text: String(content) }];
+}
+
+function openaiToolsToAnthropic(tools = []) {
+  // OpenAI tools: [{type:"function", function:{name, description, parameters}}]
+  // Anthropic tools: [{name, description, input_schema}]
+  return (tools || [])
+    .filter(t => t?.type === "function" && t.function?.name)
+    .map(t => ({
+      name: t.function.name,
+      description: t.function.description || "",
+      input_schema: t.function.parameters || { type: "object", properties: {} },
+    }));
+}
+
+function openaiToolMessageToAnthropicUserMessage(msg) {
+  // OpenAI tool message usually looks like:
+  // { role:"tool", tool_call_id:"...", content:"..." }
+  const toolUseId = msg.tool_call_id || msg.tool_callId || msg.id;
+  const resultText =
+    typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+
+  if (!toolUseId) {
+    // If we can't link to a tool_use id, treat as plain user text fallback.
+    return { role: "user", content: toAnthropicContentBlocks(resultText) };
+  }
+
+  return {
+    role: "user",
+    content: [
+      {
+        type: "tool_result",
+        tool_use_id: toolUseId,
+        content: [{ type: "text", text: resultText }],
+      },
+    ],
+  };
+}
+
+function anthropicContentToOpenAIMessage(contentBlocks) {
+  const textParts = [];
+  const toolCalls = [];
+
+  for (const b of contentBlocks || []) {
+    if (b?.type === "text") {
+      if (typeof b.text === "string") textParts.push(b.text);
+    } else if (b?.type === "tool_use") {
+      toolCalls.push({
+        id: b.id, // IMPORTANT: preserve Anthropic tool_use id
+        type: "function",
+        function: {
+          name: b.name,
+          arguments: JSON.stringify(b.input || {}),
+        },
+      });
+    }
+  }
+
+  const msg = {
+    role: "assistant",
+    content: textParts.length ? textParts.join("") : null,
+  };
+
+  if (toolCalls.length) msg.tool_calls = toolCalls;
+
+  return msg;
+}
 
 // Transform OpenAI format to Anthropic format
 function transformRequest(openAIRequest) {
