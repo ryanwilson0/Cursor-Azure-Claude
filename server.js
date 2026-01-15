@@ -498,7 +498,6 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
 
     // Always return non-streaming OpenAI-style JSON
     try {
-      const openAIResponse = transformResponse(response.data);
       const openAIResponse = transformResponse(response.data, req.body?.model);
       res.setHeader("Content-Type", "application/json; charset=utf-8");
 
