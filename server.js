@@ -189,7 +189,7 @@ function anthropicContentToOpenAIMessage(contentBlocks) {
 
   const msg = {
     role: "assistant",
-    content: textParts.length ? textParts.join("") : null,
+    content: textParts.length ? textParts.join("") : "",
   };
 
   if (toolCalls.length) msg.tool_calls = toolCalls;
