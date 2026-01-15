@@ -313,7 +313,7 @@ function transformResponse(anthropicResponse) {
       {
         index: 0,
         message: assistantMessage,
-        finish_reason: stop_reason || "stop",
+        finish_reason: assistantMessage.tool_calls?.length ? "tool_calls" : (stop_reason || "stop"),
       },
     ],
     usage: {
