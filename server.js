@@ -499,6 +499,10 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
     // Always return non-streaming OpenAI-style JSON
     try {
       const openAIResponse = transformResponse(response.data);
+      const openAIResponse = transformResponse(response.data, req.body?.model);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+
+
 
       // Cursor can treat null/empty content as "empty provider response" in some cases.
       // Ensure content is a string, especially when tool_calls are present.
@@ -645,7 +649,8 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
 
     // Transform response to OpenAI chat.completion JSON
     try {
-      const openAIResponse = transformResponse(response.data);
+      const openAIResponse = transformResponse(response.data, req.body?.model);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
 
       // Cursor/provider tolerance hardening
       const msg = openAIResponse?.choices?.[0]?.message;
