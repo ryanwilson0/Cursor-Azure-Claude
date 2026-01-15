@@ -29,6 +29,57 @@ const MODEL_NAMES_TO_MAP = [
   "claude-3-sonnet",
   "claude-3-haiku",
 ];
+function extractToolCallsFromPlainText(text, openaiTools = []) {
+  if (typeof text !== "string" || !text.length) return [];
+
+  // Build a lookup of allowed tool names -> their parameter schema
+  const toolMap = new Map();
+  for (const t of openaiTools || []) {
+    const name = t?.function?.name;
+    if (name) toolMap.set(name, t.function.parameters || {});
+  }
+
+  const calls = [];
+  const lines = text.split("\n");
+
+  // Matches: "Calling shell_command <stuff>"
+  const re = /^\s*Calling\s+([a-zA-Z0-9_]+)\s+(.+?)\s*$/;
+
+  for (const line of lines) {
+    const m = line.match(re);
+    if (!m) continue;
+
+    const toolName = m[1];
+    const rest = m[2];
+
+    if (!toolMap.has(toolName)) continue; // only emit calls for tools Cursor actually provided
+
+    const schema = toolMap.get(toolName);
+    const props = schema?.properties || {};
+
+    // Choose the best argument key for this tool
+    const argKey =
+      (props.command && "command") ||
+      (props.cmd && "cmd") ||
+      (props.input && "input") ||
+      (props.path && "path") ||
+      Object.keys(props)[0] ||
+      "command";
+
+    // Only auto-convert the tools where the single string arg makes sense
+    // (shell_command is the big one)
+    if (toolName === "shell_command" || toolName === "shell" || toolName === "run_shell") {
+      const argsObj = { [argKey]: rest };
+      calls.push({
+        id: "call_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8),
+        type: "function",
+        function: { name: toolName, arguments: JSON.stringify(argsObj) },
+      });
+    }
+  }
+
+  return calls;
+}
 
 // Function to map model name to Azure deployment name
 function mapModelToDeployment(modelName) {
@@ -379,7 +430,7 @@ function extractToolCallsFromFunctionCallMarkup(text) {
   return toolCalls;
 }
 
-function transformResponse(anthropicResponse, requestedModel) {
+function transformResponse(anthropicResponse, requestedModel, openaiTools) {
   const { content, stop_reason, usage } = anthropicResponse;
 
   const assistantMessage = anthropicContentToOpenAIMessage(content);
@@ -392,6 +443,13 @@ function transformResponse(anthropicResponse, requestedModel) {
   // Fallback: if no tool_calls but assistant emitted markup, convert it
   if (!toolCalls.length && typeof assistantMessage.content === "string") {
     const extracted = extractToolCallsFromFunctionCallMarkup(assistantMessage.content);
+    if (extracted.length) {
+      toolCalls = extracted;
+      assistantMessage.tool_calls = extracted;
+    }
+  }
+  if (!toolCalls.length && typeof assistantMessage.content === "string") {
+    const extracted = extractToolCallsFromPlainText(assistantMessage.content, openaiTools);
     if (extracted.length) {
       toolCalls = extracted;
       assistantMessage.tool_calls = extracted;
@@ -592,7 +650,7 @@ async function handleChatCompletions(req, res) {
     }
 
     // Build OpenAI response JSON
-    const openAIResponse = transformResponse(response.data, req.body?.model);
+    const openAIResponse = transformResponse(response.data, req.body?.model, req.body?.tools);
     const choice = openAIResponse?.choices?.[0] || {};
     const message = choice.message || { role: "assistant" };
     const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
