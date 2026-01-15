@@ -298,22 +298,47 @@ function transformRequest(openAIRequest) {
   return anthropicRequest;
 }
 
+function mapFinishReason(stopReason) {
+  // Anthropic -> OpenAI normalization
+  // Common Anthropic stop_reason values: "end_turn", "max_tokens", "tool_use", "stop_sequence"
+  switch (stopReason) {
+    case "end_turn":
+    case "stop_sequence":
+      return "stop";
+    case "max_tokens":
+      return "length";
+    case "tool_use":
+      return "tool_calls";
+    default:
+      return "stop";
+  }
+}
 
-function transformResponse(anthropicResponse) {
-  const { content, id, model, stop_reason, usage } = anthropicResponse;
+function makeChatCmplId() {
+  return "chatcmpl-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+}
+
+function transformResponse(anthropicResponse, requestedModel) {
+  const { content, stop_reason, usage } = anthropicResponse;
 
   const assistantMessage = anthropicContentToOpenAIMessage(content);
 
+  // Cursor tolerance: avoid null content
+  if (assistantMessage.content == null) assistantMessage.content = "";
+
+  const hasToolCalls = Array.isArray(assistantMessage.tool_calls) && assistantMessage.tool_calls.length > 0;
+
   return {
-    id: id,
+    id: makeChatCmplId(),
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: model,
+    // Use the model Cursor requested, not the Azure/Anthropic resolved version string
+    model: requestedModel || "claude-opus-4-5",
     choices: [
       {
         index: 0,
         message: assistantMessage,
-        finish_reason: assistantMessage.tool_calls?.length ? "tool_calls" : (stop_reason || "stop"),
+        finish_reason: hasToolCalls ? "tool_calls" : mapFinishReason(stop_reason),
       },
     ],
     usage: {
@@ -323,6 +348,7 @@ function transformResponse(anthropicResponse) {
     },
   };
 }
+
 
 
 // Root endpoint
