@@ -197,131 +197,107 @@ function anthropicContentToOpenAIMessage(contentBlocks) {
   return msg;
 }
 
-// Transform OpenAI format to Anthropic format
 function transformRequest(openAIRequest) {
-    const { messages, model, max_tokens, temperature, stream, role, content, input, user, ...rest } = openAIRequest;
+  const {
+    messages,
+    model,
+    max_tokens,
+    temperature,
+    stream,
+    tools,          // <-- NEW
+    tool_choice,    // <-- optional; ignore if unsupported
+    role,
+    content,
+    input,
+    user,
+    ...rest
+  } = openAIRequest;
 
-    // Handle different request formats
-    let anthropicMessages;
+  let anthropicMessages = [];
+  let systemTextParts = [];
 
-    if (messages && Array.isArray(messages)) {
-        // Standard OpenAI format with messages array
-        anthropicMessages = messages
-            .filter((msg) => msg && (msg.content || msg.content === "")) // Filter out invalid messages
-            .map((msg) => {
-                // Handle system messages by converting to user message with System prefix
-                if (msg.role === "system") {
-                    return {
-                        role: "user",
-                        content: typeof msg.content === "string" ? `System: ${msg.content}` : msg.content,
-                    };
-                }
-                // Ensure role is valid (user or assistant)
-                const role = msg.role === "assistant" ? "assistant" : "user";
-                return {
-                    role: role,
-                    content: msg.content,
-                };
-            });
-    } else if (role && content) {
-        // Cursor format with single role/content
-        anthropicMessages = [
-            {
-                role: role === "system" ? "user" : role,
-                content: role === "system" ? `System: ${content}` : content,
-            },
-        ];
-    } else if (input) {
-        // Cursor format with input field - can be array of messages or string
-        if (Array.isArray(input)) {
-            // Input is an array of message objects
-            anthropicMessages = input
-                .filter((msg) => msg && (msg.content !== undefined || msg.content === "")) // Filter out invalid messages
-                .map((msg) => {
-                    // Handle system messages
-                    if (msg.role === "system") {
-                        return {
-                            role: "user",
-                            content: typeof msg.content === "string" ? `System: ${msg.content}` : msg.content,
-                        };
-                    }
-                    // Ensure role is valid (user or assistant)
-                    const role = msg.role === "assistant" ? "assistant" : "user";
-                    return {
-                        role: role,
-                        content: msg.content !== undefined ? msg.content : String(msg),
-                    };
-                });
-        } else {
-            // Input is a string
-            anthropicMessages = [
-                {
-                    role: user || "user",
-                    content: input,
-                },
-            ];
+  // Build messages from OpenAI messages[]
+  if (messages && Array.isArray(messages)) {
+    for (const msg of messages) {
+      if (!msg) continue;
+
+      if (msg.role === "system") {
+        if (msg.content != null) systemTextParts.push(
+          typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
+        );
+        continue;
+      }
+
+      if (msg.role === "tool") {
+        anthropicMessages.push(openaiToolMessageToAnthropicUserMessage(msg));
+        continue;
+      }
+
+      const roleMapped = msg.role === "assistant" ? "assistant" : "user";
+      anthropicMessages.push({
+        role: roleMapped,
+        content: toAnthropicContentBlocks(msg.content),
+      });
+    }
+  } else if (role && content) {
+    if (role === "system") systemTextParts.push(String(content));
+    else anthropicMessages = [{ role: role === "assistant" ? "assistant" : "user", content: toAnthropicContentBlocks(content) }];
+  } else if (input) {
+    if (Array.isArray(input)) {
+      for (const msg of input) {
+        if (!msg) continue;
+        if (msg.role === "system") {
+          systemTextParts.push(String(msg.content ?? ""));
+          continue;
         }
-    } else if (content) {
-        // Just content provided
-        anthropicMessages = [
-            {
-                role: "user",
-                content: content,
-            },
-        ];
+        const roleMapped = msg.role === "assistant" ? "assistant" : "user";
+        anthropicMessages.push({
+          role: roleMapped,
+          content: toAnthropicContentBlocks(msg.content),
+        });
+      }
     } else {
-        throw new Error("Invalid request format: missing messages, role/content, input, or content field");
+      anthropicMessages = [{ role: user || "user", content: toAnthropicContentBlocks(input) }];
     }
+  } else if (content != null) {
+    anthropicMessages = [{ role: "user", content: toAnthropicContentBlocks(content) }];
+  } else {
+    throw new Error("Invalid request format: missing messages, role/content, input, or content field");
+  }
 
-    // Ensure we have at least one message
-    if (!anthropicMessages || anthropicMessages.length === 0) {
-        throw new Error("Invalid request: no valid messages found");
-    }
+  if (!anthropicMessages.length) throw new Error("Invalid request: no valid messages found");
 
-    // Build the Anthropic API request with only supported fields
-    // Map the model name to the Azure deployment name
-    const azureModelName = mapModelToDeployment(model);
-    const anthropicRequest = {
-        model: azureModelName,
-        messages: anthropicMessages,
-        max_tokens: max_tokens || 4096,
-    };
+  const azureModelName = mapModelToDeployment(model);
 
-    // Add optional fields if they exist and are valid
-    if (temperature !== undefined) {
-        anthropicRequest.temperature = temperature;
-    }
+  const anthropicRequest = {
+    model: azureModelName,
+    messages: anthropicMessages,
+    max_tokens: max_tokens || 4096,
+  };
 
-    if (stream !== undefined) {
-        anthropicRequest.stream = stream;
-    }
+  if (systemTextParts.length) {
+    anthropicRequest.system = systemTextParts.join("\n\n");
+  } else if (rest.system !== undefined) {
+    anthropicRequest.system = rest.system;
+  }
 
-    // Include supported optional fields from rest
-    // Note: stream_options is NOT supported by Azure Anthropic API
-    const supportedFields = ["metadata", "stop_sequences", "top_p", "top_k"];
-    for (const field of supportedFields) {
-        if (rest[field] !== undefined) {
-            anthropicRequest[field] = rest[field];
-        }
-    }
+  if (temperature !== undefined) anthropicRequest.temperature = temperature;
 
-    // Handle system field specially - it should be a string or array of content blocks
-    if (rest.system !== undefined) {
-        // If system is an array, it might be content blocks - pass through
-        // If it's a string, pass through
-        // If it's something else, try to convert to string
-        if (Array.isArray(rest.system)) {
-            anthropicRequest.system = rest.system;
-        } else if (typeof rest.system === "string") {
-            anthropicRequest.system = rest.system;
-        } else {
-            // Try to extract text from content blocks or convert to string
-            anthropicRequest.system = String(rest.system);
-        }
-    }
+  // NOTE: We'll handle streaming in Step 4 below (tools + streaming is trickier)
+  if (stream !== undefined) anthropicRequest.stream = stream;
 
-    return anthropicRequest;
+  // Pass through tools (OpenAI -> Anthropic)
+  const anthTools = openaiToolsToAnthropic(tools);
+  if (anthTools.length) anthropicRequest.tools = anthTools;
+
+  const supportedFields = ["metadata", "stop_sequences", "top_p", "top_k"];
+  for (const field of supportedFields) {
+    if (rest[field] !== undefined) anthropicRequest[field] = rest[field];
+  }
+
+  return anthropicRequest;
 }
+
 
 // Transform Anthropic response to OpenAI format
 function transformResponse(anthropicResponse) {
