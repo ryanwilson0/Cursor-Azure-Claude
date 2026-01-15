@@ -272,10 +272,12 @@ When you need to use a tool, you MUST output tool calls ONLY in this exact XML f
 
 <function_calls>
   <invoke name="TOOL_NAME">
-    <parameter name="param1">value</parameter>
-    <parameter name="param2">value</parameter>
+    <parameter name="path">relative/or/absolute/path</parameter>
+    <parameter name="start_line">1</parameter>
+    <parameter name="end_line">50</parameter>
   </invoke>
 </function_calls>
+
 
 Rules:
 - Do NOT write "Calling read_file ..." lines.
