@@ -1,3 +1,5 @@
+// server.js
+
 const express = require("express");
 const axios = require("axios");
 
@@ -6,12 +8,13 @@ app.use(express.json({ limit: "50mb" }));
 
 /**
  * ENV VARS REQUIRED
- * - AZURE_ENDPOINT   (full Anthropic messages endpoint)
+ * - AZURE_ENDPOINT   (full Anthropic /v1/messages endpoint URL for your Azure Anthropic deployment)
  * - AZURE_API_KEY
  * - SERVICE_API_KEY  (what you paste into Cursor "OpenAI API Key")
  *
  * Optional:
  * - AZURE_DEPLOYMENT_NAME (defaults to "claude-opus-4-5")
+ * - ANTHROPIC_VERSION (defaults to "2023-06-01")
  * - PORT (defaults to 8080)
  */
 const CONFIG = {
@@ -29,6 +32,7 @@ const MODEL_NAMES_TO_MAP = [
   "gpt-4.1",
   "gpt-4o",
   "claude-opus-4-5",
+  "claude-sonnet-4-5",
   "claude-4.5-opus-high",
   "claude-4-opus",
   "claude-3-opus",
@@ -60,7 +64,7 @@ app.use((req, res, next) => {
 
 // -------------------- Auth --------------------
 function requireAuth(req, res, next) {
-  if (req.method === "OPTIONS" || req.path === "/health" || req.path === "/" ) return next();
+  if (req.method === "OPTIONS" || req.path === "/health" || req.path === "/") return next();
 
   if (!CONFIG.SERVICE_API_KEY) {
     return res.status(500).json({ error: { message: "SERVICE_API_KEY not configured", type: "configuration_error" } });
@@ -79,7 +83,7 @@ function requireAuth(req, res, next) {
     });
   }
 
-  let token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
   if (token !== CONFIG.SERVICE_API_KEY) {
     return res.status(401).json({
       error: {
@@ -95,7 +99,11 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// -------------------- Helpers --------------------
+// -------------------- Utilities --------------------
+function makeChatCmplId() {
+  return "chatcmpl-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+}
+
 function toAnthropicContentBlocks(content) {
   if (Array.isArray(content)) return content;
   if (typeof content === "string") return [{ type: "text", text: content }];
@@ -116,6 +124,7 @@ function openaiToolsToAnthropic(tools = []) {
 }
 
 function buildToolIdToNameMap(messages) {
+  // Map tool_call_id -> tool name from prior assistant tool_calls (OpenAI format)
   const map = new Map();
   if (!Array.isArray(messages)) return map;
 
@@ -131,54 +140,9 @@ function buildToolIdToNameMap(messages) {
   }
   return map;
 }
-function parseCallingToolLines(text) {
-  if (!text || typeof text !== "string") return { tool_calls: [], cleanedText: text || "" };
 
-  const tool_calls = [];
-  const outLines = [];
-
-  const lines = text.split(/\r?\n/);
-  for (const line of lines) {
-    const m = line.match(/^\s*Calling\s+([a-zA-Z0-9_]+)\s+([\s\S]+)\s*$/);
-    if (!m) {
-      outLines.push(line);
-      continue;
-    }
-
-    const toolName = m[1];
-    const rest = m[2];
-
-    // Cursor's shell_command tool almost always wants { "command": "..." }
-    let argsObj;
-    if (toolName === "shell_command") {
-      argsObj = { command: rest };
-    } else {
-      // Attempt: if it contains JSON, parse it; else pass as { input: "..." }
-      const jsonStart = rest.indexOf("{");
-      const jsonEnd = rest.lastIndexOf("}");
-      if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
-        const jsonStr = rest.slice(jsonStart, jsonEnd + 1);
-        try {
-          argsObj = JSON.parse(jsonStr);
-        } catch {
-          argsObj = { input: rest };
-        }
-      } else {
-        argsObj = { input: rest };
-      }
-    }
-
-    tool_calls.push({
-      id: "call_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10),
-      type: "function",
-      function: { name: toolName, arguments: JSON.stringify(argsObj) },
-    });
-  }
-
-  return { tool_calls, cleanedText: outLines.join("\n").trim() };
-}
-
-function openaiToolMessageToAnthropicUserMessage(msg, toolIdToName) {
+function openaiToolMessageToAnthropicToolResult(msg, toolIdToName) {
+  // OpenAI tool message: { role:"tool", tool_call_id:"...", content:"..." }
   const toolUseId = msg.tool_call_id || msg.tool_callId || msg.id;
   const toolName = toolUseId ? toolIdToName.get(toolUseId) : null;
 
@@ -192,108 +156,28 @@ function openaiToolMessageToAnthropicUserMessage(msg, toolIdToName) {
     }
   }
 
-  // IMPORTANT: We do NOT rely on Anthropic-native tool_result because Azure may not honor it.
-  // We pass tool results as plain user-visible text so Claude can continue correctly.
-  const wrapped =
-    (toolName ? `TOOL_RESULT for ${toolName}` : "TOOL_RESULT") +
-    (toolUseId ? ` (tool_call_id=${toolUseId})` : "") +
-    ":\n" +
-    resultText;
+  // Preferred: real Anthropic tool_result (lets model reliably continue tool loop)
+  if (toolUseId) {
+    return {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseId,
+          content: [{ type: "text", text: resultText }],
+        },
+      ],
+    };
+  }
 
+  // Fallback if no tool_use_id
+  const wrapped =
+    (toolName ? `TOOL_RESULT for ${toolName}` : "TOOL_RESULT") + ":\n" + resultText;
   return { role: "user", content: toAnthropicContentBlocks(wrapped) };
 }
 
-// Parse Cursor/Claude text tool markup like:
-// <function_calls>
-//   <invoke name="read_file">
-//     <parameter name="file_path">...</parameter>
-//   </invoke>
-// </function_calls>
-function parseFunctionCallsFromText(text) {
-  if (!text || typeof text !== "string") return { tool_calls: [], cleanedText: text || "" };
-
-  const toolCalls = [];
-
-  const fcStart = text.indexOf("<function_calls>");
-  const fcEnd = text.indexOf("</function_calls>");
-  let cleaned = text;
-
-  let block = null;
-  if (fcStart !== -1 && fcEnd !== -1 && fcEnd > fcStart) {
-    block = text.slice(fcStart, fcEnd + "</function_calls>".length);
-    cleaned = (text.slice(0, fcStart) + text.slice(fcEnd + "</function_calls>".length)).trim();
-  }
-
-  // Also strip <thinking>...</thinking> (Cursor users do not want it surfaced)
-  cleaned = cleaned.replace(/<thinking>[\s\S]*?<\/thinking>/g, "").trim();
-
-  if (!block) return { tool_calls: [], cleanedText: cleaned };
-
-  const invokeRegex = /<invoke\s+name="([^"]+)">([\s\S]*?)<\/invoke>/g;
-  const paramRegex = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/g;
-
-  let m;
-  while ((m = invokeRegex.exec(block)) !== null) {
-    const toolName = (m[1] || "").trim();
-    const invokeBody = m[2] || "";
-    const args = {};
-
-    let p;
-    while ((p = paramRegex.exec(invokeBody)) !== null) {
-      const key = (p[1] || "").trim();
-      const rawVal = (p[2] || "").trim();
-
-      // Try to parse JSON-looking values; otherwise keep string
-      let val = rawVal;
-      if ((rawVal.startsWith("{") && rawVal.endsWith("}")) || (rawVal.startsWith("[") && rawVal.endsWith("]"))) {
-        try {
-          val = JSON.parse(rawVal);
-        } catch {
-          val = rawVal;
-        }
-      }
-      args[key] = val;
-    }
-
-    if (toolName) {
-      const id = "call_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10);
-      toolCalls.push({
-        id,
-        type: "function",
-        function: {
-          name: toolName,
-          arguments: JSON.stringify(args || {}),
-        },
-      });
-    }
-  }
-
-  return { tool_calls: toolCalls, cleanedText: cleaned };
-}
-
-function anthropicContentToTextAndToolCalls(anthropicContent) {
-  const textParts = [];
-  const toolCalls = [];
-
-  for (const b of anthropicContent || []) {
-    if (b?.type === "text" && typeof b.text === "string") {
-      textParts.push(b.text);
-    } else if (b?.type === "tool_use") {
-      toolCalls.push({
-        id: b.id,
-        type: "function",
-        function: {
-          name: b.name,
-          arguments: JSON.stringify(b.input || {}),
-        },
-      });
-    }
-  }
-
-  return { text: textParts.join(""), tool_calls: toolCalls };
-}
-
 function mapFinishReason(stopReason) {
+  // Anthropic stop_reason -> OpenAI finish_reason
   switch (stopReason) {
     case "end_turn":
     case "stop_sequence":
@@ -307,42 +191,149 @@ function mapFinishReason(stopReason) {
   }
 }
 
-function makeChatCmplId() {
-  return "chatcmpl-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+function safeParseValue(v) {
+  if (typeof v !== "string") return v;
+  const s = v.trim();
+  if (!s) return s;
+
+  // JSON
+  if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+    try {
+      return JSON.parse(s);
+    } catch (_) {}
+  }
+
+  // int
+  if (/^-?\d+$/.test(s)) return parseInt(s, 10);
+
+  // float
+  if (/^-?\d+\.\d+$/.test(s)) return parseFloat(s);
+
+  return s;
 }
 
+function getAllowedToolNames(reqBody) {
+  const set = new Set();
+  const tools = Array.isArray(reqBody?.tools) ? reqBody.tools : [];
+  for (const t of tools) {
+    if (t?.type === "function" && t?.function?.name) set.add(t.function.name);
+  }
+  return set;
+}
+
+function extractToolCallsFromAssistantText(text, allowedToolNames) {
+  // Fallback parser when upstream returns "Calling tool ..." or XML <function_calls> markup as text.
+  const tool_calls = [];
+  let cleaned = typeof text === "string" ? text : "";
+
+  const mkToolCall = (name, argsObj) => ({
+    id: "call_" + Math.random().toString(36).slice(2, 10),
+    type: "function",
+    function: {
+      name,
+      arguments: JSON.stringify(argsObj ?? {}),
+    },
+  });
+
+  const isAllowed = (name) => {
+    if (!name) return false;
+    if (!allowedToolNames || allowedToolNames.size === 0) return true;
+    return allowedToolNames.has(name);
+  };
+
+  // Strip <thinking>...</thinking> from visible text
+  cleaned = cleaned.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "");
+
+  // 1) Parse <function_calls> XML blocks
+  if (cleaned.includes("<function_calls>") && cleaned.includes("</function_calls>")) {
+    const blockRe = /<function_calls>[\s\S]*?<\/function_calls>/gi;
+    const invokeRe = /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/invoke>/gi;
+    const paramRe = /<parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/parameter>/gi;
+
+    const blocks = cleaned.match(blockRe) || [];
+    for (const block of blocks) {
+      let m;
+      while ((m = invokeRe.exec(block))) {
+        const toolName = (m[1] || "").trim();
+        if (!isAllowed(toolName)) continue;
+
+        const body = m[2] || "";
+        const args = {};
+        let pm;
+        while ((pm = paramRe.exec(body))) {
+          const k = (pm[1] || "").trim();
+          const v = safeParseValue(pm[2] || "");
+          if (k) args[k] = v;
+        }
+        tool_calls.push(mkToolCall(toolName, args));
+      }
+    }
+
+    // Remove all function_calls blocks from visible content
+    cleaned = cleaned.replace(blockRe, "").trim();
+  }
+
+  // 2) Parse "Calling <tool> <rest>"
+  {
+    const callLineRe = /^Calling\s+([A-Za-z0-9_-]+)\s+(.+)$/gmi;
+    let cm;
+    while ((cm = callLineRe.exec(cleaned))) {
+      const toolName = (cm[1] || "").trim();
+      const rest = (cm[2] || "").trim();
+      if (!isAllowed(toolName)) continue;
+
+      // Cursor's shell_command typically expects { command: "..." }
+      if (toolName === "shell_command") {
+        tool_calls.push(mkToolCall("shell_command", { command: rest }));
+      } else {
+        tool_calls.push(mkToolCall(toolName, { input: rest }));
+      }
+    }
+  }
+
+  // If we extracted "Calling ..." lines, remove them from visible content
+  cleaned = cleaned
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*Calling\s+[A-Za-z0-9_-]+\s+.+\s*$/.test(line))
+    .join("\n")
+    .trim();
+
+  return { cleaned, tool_calls };
+}
+
+// -------------------- Transforms --------------------
 function transformRequestToAnthropic(openAIRequest) {
   const { messages, model, max_tokens, temperature, tools, ...rest } = openAIRequest;
 
+  if (!Array.isArray(messages)) {
+    throw new Error("Invalid request format: expected messages[]");
+  }
+
   const toolIdToName = buildToolIdToNameMap(messages);
 
-  let anthropicMessages = [];
-  let systemTextParts = [];
+  const anthropicMessages = [];
+  const systemTextParts = [];
 
-  if (Array.isArray(messages)) {
-    for (const msg of messages) {
-      if (!msg) continue;
+  for (const msg of messages) {
+    if (!msg) continue;
 
-      if (msg.role === "system") {
-        if (msg.content != null) {
-          systemTextParts.push(typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content));
-        }
-        continue;
+    if (msg.role === "system") {
+      if (msg.content != null) {
+        systemTextParts.push(typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content));
       }
-
-      if (msg.role === "tool") {
-        anthropicMessages.push(openaiToolMessageToAnthropicUserMessage(msg, toolIdToName));
-        continue;
-      }
-
-      const roleMapped = msg.role === "assistant" ? "assistant" : "user";
-      anthropicMessages.push({
-        role: roleMapped,
-        content: toAnthropicContentBlocks(msg.content),
-      });
+      continue;
     }
-  } else {
-    throw new Error("Invalid request format: expected messages[]");
+
+    if (msg.role === "tool") {
+      anthropicMessages.push(openaiToolMessageToAnthropicToolResult(msg, toolIdToName));
+      continue;
+    }
+
+    const roleMapped = msg.role === "assistant" ? "assistant" : "user";
+    anthropicMessages.push({
+      role: roleMapped,
+      content: toAnthropicContentBlocks(msg.content),
+    });
   }
 
   if (!anthropicMessages.length) throw new Error("Invalid request: no messages");
@@ -363,11 +354,11 @@ function transformRequestToAnthropic(openAIRequest) {
 
   if (temperature !== undefined) anthropicRequest.temperature = temperature;
 
-  // Try passing tools through (safe if Azure supports it). If Azure ignores it, we still parse tool markup from text.
+  // Pass tools through to Anthropic if supported upstream
   const anthTools = openaiToolsToAnthropic(tools);
   if (anthTools.length) anthropicRequest.tools = anthTools;
 
-  // Copy a small set of supported fields
+  // Copy a small set of fields that are commonly accepted
   const supportedFields = ["metadata", "stop_sequences", "top_p", "top_k"];
   for (const f of supportedFields) {
     if (rest[f] !== undefined) anthropicRequest[f] = rest[f];
@@ -376,35 +367,52 @@ function transformRequestToAnthropic(openAIRequest) {
   return anthropicRequest;
 }
 
-function transformAzureToOpenAI(azureResp, requestedModel) {
-  const { content, stop_reason, usage } = azureResp || {};
+function anthropicContentToOpenAIMessage(contentBlocks) {
+  const textParts = [];
+  const toolCalls = [];
 
-  // 1) If Azure returns Anthropic-native tool_use blocks, convert those directly.
-  const { text, tool_calls: nativeToolCalls } = anthropicContentToTextAndToolCalls(content);
-
-  // 2) If no native tool_use blocks, parse Cursor/Claude text markup (<function_calls><invoke ...>)
-  let toolCalls = nativeToolCalls;
-  let cleanedText = text;
-
-  if (!toolCalls.length) {
-    const parsed = parseCallingToolLines(text);
-    toolCalls = parsed.tool_calls;
-    cleanedText = parsed.cleanedText;
-  } else {
-    // still strip thinking tags if present
-    cleanedText = (cleanedText || "").replace(/<thinking>[\s\S]*?<\/thinking>/g, "").trim();
+  for (const b of contentBlocks || []) {
+    if (b?.type === "text" && typeof b.text === "string") {
+      textParts.push(b.text);
+    } else if (b?.type === "tool_use") {
+      toolCalls.push({
+        id: b.id,
+        type: "function",
+        function: {
+          name: b.name,
+          arguments: JSON.stringify(b.input || {}),
+        },
+      });
+    }
   }
-
-  const hasToolCalls = toolCalls.length > 0;
 
   const msg = {
     role: "assistant",
-    // IMPORTANT: If tool calls exist, keep the user-facing text (but without tool markup).
-    // Cursor can handle both content + tool_calls.
-    content: cleanedText || "",
+    content: textParts.join("") || "",
   };
 
-  if (hasToolCalls) msg.tool_calls = toolCalls;
+  if (toolCalls.length) msg.tool_calls = toolCalls;
+
+  return msg;
+}
+
+function transformAnthropicToOpenAI(anthropicResp, requestedModel, allowedToolNames) {
+  const { content, stop_reason, usage } = anthropicResp || {};
+
+  // Primary path: tool_use blocks -> tool_calls
+  const assistantMessage = anthropicContentToOpenAIMessage(content);
+
+  // Fallback parsing when tool calls show up as text markup
+  const toolCalls = Array.isArray(assistantMessage.tool_calls) ? assistantMessage.tool_calls : [];
+  if (toolCalls.length === 0) {
+    const parsed = extractToolCallsFromAssistantText(assistantMessage.content || "", allowedToolNames);
+    if (parsed.tool_calls.length > 0) {
+      assistantMessage.content = parsed.cleaned || "";
+      assistantMessage.tool_calls = parsed.tool_calls;
+    }
+  }
+
+  const hasToolCalls = Array.isArray(assistantMessage.tool_calls) && assistantMessage.tool_calls.length > 0;
 
   return {
     id: makeChatCmplId(),
@@ -414,7 +422,7 @@ function transformAzureToOpenAI(azureResp, requestedModel) {
     choices: [
       {
         index: 0,
-        message: msg,
+        message: assistantMessage,
         finish_reason: hasToolCalls ? "tool_calls" : mapFinishReason(stop_reason),
       },
     ],
@@ -426,103 +434,215 @@ function transformAzureToOpenAI(azureResp, requestedModel) {
   };
 }
 
-function sendOpenAISSE(res, openAIResponse) {
-  const choice = openAIResponse?.choices?.[0] || {};
-  const message = choice.message || { role: "assistant", content: "" };
+// -------------------- SSE Streaming --------------------
+function createSSE(res, model) {
+  const id = makeChatCmplId();
+  const created = Math.floor(Date.now() / 1000);
+  const m = model || "claude-opus-4-5";
 
-  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-  const hasToolCalls = toolCalls.length > 0;
-
-  const id = openAIResponse.id || makeChatCmplId();
-  const created = openAIResponse.created || Math.floor(Date.now() / 1000);
-  const model = openAIResponse.model || "claude-opus-4-5";
-
-  // IMPORTANT: If handleChatCompletions already started SSE, do NOT set headers again.
-  if (!res.headersSent) {
-    res.status(200);
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Accel-Buffering", "no");
-    res.flushHeaders?.();
-  }
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
 
   const writeChunk = (delta, finish_reason = null) => {
     const chunk = {
       id,
       object: "chat.completion.chunk",
       created,
-      model,
-      choices: [{ index: 0, delta, finish_reason }],
+      model: m,
+      choices: [{ index: 0, delta: delta || {}, finish_reason }],
     };
     res.write(`data: ${JSON.stringify(chunk)}\n\n`);
   };
 
-  // role chunk (safe to send twice; Cursor tolerates it)
-  writeChunk({ role: "assistant" }, null);
+  const writeComment = (comment) => {
+    // SSE comment keepalive; OpenAI clients ignore these safely
+    res.write(`: ${comment || "keepalive"}\n\n`);
+  };
 
-  // content chunks
-  const text = typeof message.content === "string" ? message.content : "";
-  if (text.length) {
-    const CHUNK = 1500;
-    for (let i = 0; i < text.length; i += CHUNK) {
-      writeChunk({ content: text.slice(i, i + CHUNK) }, null);
-    }
-  }
+  const done = (finish_reason = "stop") => {
+    writeChunk({}, finish_reason);
+    res.write("data: [DONE]\n\n");
+    res.end();
+  };
 
-  // tool_calls in incremental OpenAI streaming format (Cursor requires this pattern)
-  if (hasToolCalls) {
-    const ARG_CHUNK = 1200;
+  const error = (message) => {
+    writeChunk({ content: message ? String(message) : "Proxy error" }, null);
+    done("stop");
+  };
 
-    for (let idx = 0; idx < toolCalls.length; idx++) {
-      const tc = toolCalls[idx];
-      const name = tc?.function?.name || "unknown_tool";
-      const args = tc?.function?.arguments || "";
-      const tcId =
-        tc?.id || ("call_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10));
+  return { id, created, model: m, writeChunk, writeComment, done, error };
+}
 
-      // announce tool call id/name
-      writeChunk(
+function sseSendToolCalls(sse, toolCalls) {
+  // Cursor is picky: stream tool_calls as OpenAI-style deltas with indices and chunked arguments.
+  const ARG_CHUNK = 1200;
+
+  for (let idx = 0; idx < toolCalls.length; idx++) {
+    const tc = toolCalls[idx];
+    const name = tc?.function?.name || "unknown_tool";
+    const args = tc?.function?.arguments || "";
+    const tcId = tc?.id || ("call_" + Math.random().toString(36).slice(2, 10));
+
+    // announce id/name
+    sse.writeChunk(
+      {
+        tool_calls: [
+          {
+            index: idx,
+            id: tcId,
+            type: "function",
+            function: { name, arguments: "" },
+          },
+        ],
+      },
+      null
+    );
+
+    // stream args
+    for (let i = 0; i < args.length; i += ARG_CHUNK) {
+      sse.writeChunk(
         {
           tool_calls: [
             {
               index: idx,
-              id: tcId,
-              type: "function",
-              function: { name, arguments: "" },
+              function: { arguments: args.slice(i, i + ARG_CHUNK) },
             },
           ],
         },
         null
       );
+    }
+  }
+}
 
-      // stream arguments in chunks
-      for (let i = 0; i < args.length; i += ARG_CHUNK) {
-        writeChunk(
-          {
-            tool_calls: [
-              {
-                index: idx,
-                function: { arguments: args.slice(i, i + ARG_CHUNK) },
-              },
-            ],
-          },
-          null
-        );
+// -------------------- Main Handler --------------------
+async function handleChatCompletions(req, res) {
+  console.log("[REQUEST /chat/completions]", new Date().toISOString());
+  console.log("Model:", req.body?.model, "Stream:", req.body?.stream);
+
+  const toolsCount = Array.isArray(req.body?.tools) ? req.body.tools.length : 0;
+  console.log("Tools present:", toolsCount);
+  console.log("Roles:", Array.isArray(req.body?.messages) ? req.body.messages.map((m) => m.role) : []);
+
+  const requestedModel = req.body?.model || "claude-opus-4-5";
+  const wantStream = req.body?.stream === true;
+  const allowedToolNames = getAllowedToolNames(req.body);
+
+  let sse = null;
+  let keepalive = null;
+
+  // If streaming, open SSE immediately (prevents Cursor timeout / "Empty provider response")
+  if (wantStream) {
+    sse = createSSE(res, requestedModel);
+    sse.writeChunk({ role: "assistant" }, null);
+
+    // keepalive while Azure works
+    keepalive = setInterval(() => {
+      try {
+        sse.writeComment("keepalive");
+      } catch (_) {
+        clearInterval(keepalive);
+      }
+    }, 15000);
+
+    // stop keepalive on client disconnect
+    req.on("close", () => {
+      if (keepalive) clearInterval(keepalive);
+    });
+  }
+
+  try {
+    if (!CONFIG.AZURE_API_KEY) {
+      const msg = "Azure API key not configured";
+      if (wantStream) return sse.error(msg);
+      return res.status(500).json({ error: { message: msg, type: "configuration_error" } });
+    }
+    if (!CONFIG.AZURE_ENDPOINT) {
+      const msg = "Azure endpoint not configured";
+      if (wantStream) return sse.error(msg);
+      return res.status(500).json({ error: { message: msg, type: "configuration_error" } });
+    }
+    if (!req.body || !Array.isArray(req.body.messages)) {
+      const msg = "Invalid request: expected messages[]";
+      if (wantStream) return sse.error(msg);
+      return res.status(400).json({ error: { message: msg, type: "invalid_request_error" } });
+    }
+
+    // Always call Azure non-streaming; we stream to Cursor ourselves.
+    const reqForAzure = { ...req.body, stream: false };
+
+    const anthropicRequest = transformRequestToAnthropic(reqForAzure);
+    anthropicRequest.stream = false;
+
+    console.log("[AZURE] Calling Azure Anthropic API (non-streaming)...");
+    const response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": CONFIG.AZURE_API_KEY,
+        "anthropic-version": CONFIG.ANTHROPIC_VERSION,
+      },
+      timeout: 120000,
+      responseType: "json",
+      validateStatus: (s) => s < 600,
+    });
+
+    console.log("[AZURE] Response status:", response.status);
+
+    if (keepalive) clearInterval(keepalive);
+
+    if (response.status >= 400) {
+      const msg = response.data?.error?.message || response.data?.message || "Azure API error";
+      console.error("[ERROR] Azure error:", msg);
+      if (wantStream) return sse.error(msg);
+      return res.status(response.status).json({ error: { message: msg, type: "api_error", code: response.status } });
+    }
+
+    const openAIResponse = transformAnthropicToOpenAI(response.data, requestedModel, allowedToolNames);
+
+    // Non-stream response
+    if (!wantStream) {
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      console.log("[RESPONSE] Sending JSON response");
+      return res.status(200).json(openAIResponse);
+    }
+
+    // Stream response
+    console.log("[RESPONSE] Sending SSE response");
+
+    const choice0 = openAIResponse?.choices?.[0] || {};
+    const msg0 = choice0.message || { role: "assistant", content: "" };
+    const toolCalls = Array.isArray(msg0.tool_calls) ? msg0.tool_calls : [];
+    const hasToolCalls = toolCalls.length > 0;
+
+    const text = typeof msg0.content === "string" ? msg0.content : "";
+    if (text.length) {
+      const CHUNK = 1500;
+      for (let i = 0; i < text.length; i += CHUNK) {
+        sse.writeChunk({ content: text.slice(i, i + CHUNK) }, null);
       }
     }
 
-    writeChunk({}, "tool_calls");
-    res.write("data: [DONE]\n\n");
-    return res.end();
+    if (hasToolCalls) {
+      sseSendToolCalls(sse, toolCalls);
+      return sse.done("tool_calls");
+    }
+
+    return sse.done("stop");
+  } catch (e) {
+    if (keepalive) clearInterval(keepalive);
+
+    const errMsg = e?.message || String(e);
+    console.error("[ERROR] /chat/completions exception:", errMsg);
+
+    if (wantStream && sse) return sse.error(errMsg);
+
+    return res.status(500).json({ error: { message: errMsg, type: "proxy_error" } });
   }
-
-  writeChunk({}, "stop");
-  res.write("data: [DONE]\n\n");
-  return res.end();
 }
-
-
 
 // -------------------- Endpoints --------------------
 app.get("/", (req, res) => {
@@ -574,334 +694,6 @@ app.get("/models", requireAuth, (req, res) => {
     ],
   });
 });
-function makeChatCmplId() {
-  return "chatcmpl-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
-}
-
-function getToolNameSet(reqBody) {
-  const set = new Set();
-  const tools = Array.isArray(reqBody?.tools) ? reqBody.tools : [];
-  for (const t of tools) {
-    if (t?.function?.name) set.add(t.function.name);
-    else if (t?.name) set.add(t.name);
-  }
-  return set;
-}
-
-function safeParseValue(v) {
-  if (typeof v !== "string") return v;
-  const s = v.trim();
-  if (!s) return s;
-
-  // Try JSON
-  if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
-    try { return JSON.parse(s); } catch (_) {}
-  }
-
-  // Try int
-  if (/^-?\d+$/.test(s)) return parseInt(s, 10);
-
-  // Try float
-  if (/^-?\d+\.\d+$/.test(s)) return parseFloat(s);
-
-  return s;
-}
-
-function extractToolCallsFromText(text, allowedToolNames) {
-  const tool_calls = [];
-  let cleaned = typeof text === "string" ? text : "";
-
-  const mkToolCall = (name, argsObj) => ({
-    id: "call_" + Math.random().toString(36).slice(2, 10),
-    type: "function",
-    function: {
-      name,
-      arguments: JSON.stringify(argsObj ?? {}),
-    },
-  });
-
-  const isAllowed = (name) => {
-    if (!name) return false;
-    if (!allowedToolNames || allowedToolNames.size === 0) return true;
-    return allowedToolNames.has(name);
-  };
-
-  // 1) Parse Cursor-style XML tool calls:
-  // <function_calls>
-  //   <invoke name="read_file">
-  //     <parameter name="file_path">...</parameter>
-  //   </invoke>
-  // </function_calls>
-  if (cleaned.includes("<invoke") && cleaned.includes("name=")) {
-    const invokeRe = /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/invoke>/gi;
-    const paramRe = /<parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/parameter>/gi;
-
-    let m;
-    while ((m = invokeRe.exec(cleaned))) {
-      const toolName = (m[1] || "").trim();
-      if (!isAllowed(toolName)) continue;
-
-      const body = m[2] || "";
-      const args = {};
-      let pm;
-      while ((pm = paramRe.exec(body))) {
-        const k = (pm[1] || "").trim();
-        const v = safeParseValue(pm[2] || "");
-        if (k) args[k] = v;
-      }
-
-      tool_calls.push(mkToolCall(toolName, args));
-    }
-
-    // Remove function_calls + thinking blocks from visible content (keep any surrounding explanation)
-    cleaned = cleaned
-      .replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, "")
-      .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
-      .trim();
-  }
-
-  // 2) Parse simple "Calling shell_command <cmd>" lines
-  // Example: "Calling shell_command cat /path | head -20"
-  {
-    const callLineRe = /^Calling\s+([A-Za-z0-9_-]+)\s+(.+)$/gmi;
-    let cm;
-    while ((cm = callLineRe.exec(cleaned))) {
-      const toolName = (cm[1] || "").trim();
-      const rest = (cm[2] || "").trim();
-      if (!isAllowed(toolName)) continue;
-
-      // We only safely auto-parse shell_command here; others are too ambiguous in free text.
-      if (toolName === "shell_command") {
-        tool_calls.push(mkToolCall("shell_command", { command: rest }));
-      }
-    }
-  }
-
-  return { cleaned, tool_calls };
-}
-
-function createSSE(res, model) {
-  const id = makeChatCmplId();
-  const created = Math.floor(Date.now() / 1000);
-  const m = model || "claude-opus-4-5";
-
-  res.status(200);
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-  res.flushHeaders?.();
-
-  const writeChunk = (delta, finish_reason = null) => {
-    const chunk = {
-      id,
-      object: "chat.completion.chunk",
-      created,
-      model: m,
-      choices: [{ index: 0, delta: delta || {}, finish_reason }],
-    };
-    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-  };
-
-  const done = (finish_reason = "stop") => {
-    writeChunk({}, finish_reason);
-    res.write("data: [DONE]\n\n");
-    res.end();
-  };
-
-  const error = (message) => {
-    // Send an assistant-visible error and terminate the stream cleanly.
-    writeChunk({ content: message ? String(message) : "Proxy error" }, null);
-    done("stop");
-  };
-
-  return { writeChunk, done, error, id, created, model: m };
-}
-
-function sseSendToolCalls(sse, toolCalls) {
-  // OpenAI streaming expects tool_calls with indices; some clients are picky.
-  // We send two deltas: one declares calls + names; second sends arguments.
-  const declared = toolCalls.map((tc, idx) => ({
-    index: idx,
-    id: tc.id,
-    type: "function",
-    function: { name: tc.function?.name, arguments: "" },
-  }));
-  sse.writeChunk({ tool_calls: declared }, null);
-
-  const withArgs = toolCalls.map((tc, idx) => ({
-    index: idx,
-    function: { arguments: tc.function?.arguments || "" },
-  }));
-  sse.writeChunk({ tool_calls: withArgs }, null);
-}
-
-async function handleChatCompletions(req, res) {
-  console.log("[REQUEST /chat/completions]", new Date().toISOString());
-  console.log("Model:", req.body?.model, "Stream:", req.body?.stream);
-
-  const toolsCount = Array.isArray(req.body?.tools) ? req.body.tools.length : 0;
-  console.log("Tools present:", toolsCount);
-  console.log("Roles:", Array.isArray(req.body?.messages) ? req.body.messages.map((m) => m.role) : []);
-
-  const requestedModel = req.body?.model || "claude-opus-4-5";
-  const wantStream = req.body?.stream === true;
-  const allowedToolNames = getToolNameSet(req.body);
-
-  let sse = null;
-  let keepalive = null;
-
-  try {
-    if (!CONFIG.AZURE_API_KEY) {
-      const msg = "Azure API key not configured";
-      if (wantStream) {
-        sse = createSSE(res, requestedModel);
-        sse.error(msg);
-        return;
-      }
-      return res.status(500).json({ error: { message: msg, type: "configuration_error" } });
-    }
-
-    if (!CONFIG.AZURE_ENDPOINT) {
-      const msg = "Azure endpoint not configured";
-      if (wantStream) {
-        sse = createSSE(res, requestedModel);
-        sse.error(msg);
-        return;
-      }
-      return res.status(500).json({ error: { message: msg, type: "configuration_error" } });
-    }
-
-    if (!req.body || !Array.isArray(req.body.messages)) {
-      const msg = "Invalid request: expected messages[]";
-      if (wantStream) {
-        sse = createSSE(res, requestedModel);
-        sse.error(msg);
-        return;
-      }
-      return res.status(400).json({ error: { message: msg, type: "invalid_request_error" } });
-    }
-
-    // If streaming, start SSE immediately so Cursor doesn't time out.
-    if (wantStream) {
-      sse = createSSE(res, requestedModel);
-
-      // Initial role chunk (lets Cursor know provider is alive)
-      sse.writeChunk({ role: "assistant" }, null);
-
-      // Keepalive chunk every 15s while Azure is working
-      keepalive = setInterval(() => {
-        try {
-          sse.writeChunk({}, null);
-        } catch (_) {
-          // If client disconnected, this will throw; stop keepalive.
-          clearInterval(keepalive);
-        }
-      }, 15000);
-    }
-
-    // Always call Azure non-streaming; we do streaming to Cursor ourselves.
-    const reqForAzure = { ...req.body, stream: false };
-
-    // Use your existing OpenAI->Anthropic transform (must keep tools/messages/system handling you already have)
-    const anthropicRequest = transformRequest(reqForAzure);
-    anthropicRequest.stream = false;
-
-    console.log("[AZURE] Calling Azure Anthropic API (non-streaming)...");
-    const response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": CONFIG.AZURE_API_KEY,
-        "anthropic-version": CONFIG.ANTHROPIC_VERSION,
-      },
-      timeout: 120000,
-      responseType: "json",
-      validateStatus: (s) => s < 600,
-    });
-
-    console.log("[AZURE] Response status:", response.status);
-
-    if (keepalive) clearInterval(keepalive);
-
-    if (response.status >= 400) {
-      const msg = response.data?.error?.message || response.data?.message || "Azure API error";
-      console.error("[ERROR] Azure error:", msg);
-
-      if (wantStream && sse) {
-        sse.error(msg);
-        return;
-      }
-      return res.status(response.status).json({ error: { message: msg, type: "api_error", code: response.status } });
-    }
-
-    // Use your existing Anthropic->OpenAI transform (should surface tool_calls when Azure returns tool_use blocks)
-    const openAIResponse = transformResponse(response.data, requestedModel);
-
-    // Fallback: If no tool_calls, try extracting them from assistant text (<function_calls>… or "Calling shell_command …")
-    const choice0 = openAIResponse?.choices?.[0];
-    const msg0 = choice0?.message || { role: "assistant", content: "" };
-
-    const toolCalls0 = Array.isArray(msg0.tool_calls) ? msg0.tool_calls : [];
-    const hasToolCalls0 = toolCalls0.length > 0;
-
-    if (!hasToolCalls0) {
-      const parsed = extractToolCallsFromText(msg0.content || "", allowedToolNames);
-      if (parsed.tool_calls.length > 0) {
-        msg0.content = parsed.cleaned || "";
-        msg0.tool_calls = parsed.tool_calls;
-        choice0.finish_reason = "tool_calls";
-        openAIResponse.choices[0].message = msg0;
-      }
-    }
-
-    // Non-stream response
-    if (!wantStream) {
-      res.setHeader("Content-Type", "application/json; charset=utf-8");
-      console.log("[RESPONSE] Sending JSON response");
-      return res.status(200).json(openAIResponse);
-    }
-
-    // Stream response
-    console.log("[RESPONSE] Sending SSE response");
-
-    const finalChoice = openAIResponse.choices?.[0] || {};
-    const finalMsg = finalChoice.message || { role: "assistant", content: "" };
-    const finalToolCalls = Array.isArray(finalMsg.tool_calls) ? finalMsg.tool_calls : [];
-    const hasToolCalls = finalToolCalls.length > 0;
-
-    if (typeof finalMsg.content === "string" && finalMsg.content.length) {
-      sse.writeChunk({ content: finalMsg.content }, null);
-    }
-
-    if (hasToolCalls) {
-      sseSendToolCalls(sse, finalToolCalls);
-      sse.done("tool_calls");
-      return;
-    }
-
-    sse.done("stop");
-  } catch (e) {
-    if (keepalive) clearInterval(keepalive);
-
-    const errMsg = e?.message || String(e);
-    console.error("[ERROR] /chat/completions exception:", errMsg);
-
-    // If we already started SSE, we cannot send JSON headers.
-    if (wantStream) {
-      try {
-        if (!sse) sse = createSSE(res, req.body?.model || "claude-opus-4-5");
-        sse.error(errMsg);
-      } catch (_) {
-        // If client is gone, just end.
-        try { res.end(); } catch (_) {}
-      }
-      return;
-    }
-
-    return res.status(500).json({ error: { message: errMsg, type: "proxy_error" } });
-  }
-}
-
 
 // Cursor uses this
 app.post("/chat/completions", requireAuth, handleChatCompletions);
@@ -909,8 +701,8 @@ app.post("/chat/completions", requireAuth, handleChatCompletions);
 // Some clients call this
 app.post("/v1/chat/completions", requireAuth, handleChatCompletions);
 
-// Optional: keep Anthropic-native passthrough for debugging
-app.post("/v1/messages", async (req, res) => {
+// Optional: Anthropic-native passthrough for debugging (auth-protected)
+app.post("/v1/messages", requireAuth, async (req, res) => {
   try {
     if (!CONFIG.AZURE_API_KEY) throw new Error("Azure API key not configured");
     if (!CONFIG.AZURE_ENDPOINT) throw new Error("Azure endpoint not configured");
@@ -936,7 +728,8 @@ app.post("/v1/messages", async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({
     error: {
-      message: "Endpoint not found. Available: GET /, GET /health, GET /v1/models, POST /chat/completions, POST /v1/chat/completions, POST /v1/messages",
+      message:
+        "Endpoint not found. Available: GET /, GET /health, GET /v1/models, POST /chat/completions, POST /v1/chat/completions, POST /v1/messages",
       type: "not_found",
     },
   });
@@ -956,5 +749,6 @@ app.listen(CONFIG.PORT, "0.0.0.0", () => {
   console.log("  GET  /v1/models");
   console.log("  POST /chat/completions");
   console.log("  POST /v1/chat/completions");
+  console.log("  POST /v1/messages (debug)");
   console.log("=".repeat(80) + "\n");
 });
