@@ -386,7 +386,9 @@ app.get("/health", (req, res) => {
 app.post("/chat/completions", requireAuth, async (req, res) => {
   console.log("[REQUEST /chat/completions]", new Date().toISOString());
   console.log("Model:", req.body?.model, "Stream:", req.body?.stream);
-  console.log("Tools present:", Array.isArray(req.body?.tools) ? req.body.tools.length : 0);
+
+  const toolsCount = Array.isArray(req.body?.tools) ? req.body.tools.length : 0;
+  console.log("Tools present:", toolsCount);
   console.log("Roles:", Array.isArray(req.body?.messages) ? req.body.messages.map(m => m.role) : []);
 
   try {
@@ -403,7 +405,7 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
       return res.status(400).json({ error: { message: "Invalid request: empty body", type: "invalid_request_error" } });
     }
 
-    // Validate request has something we can turn into messages
+    // Validate request has something transformable
     const hasMessages = Array.isArray(req.body.messages);
     const hasRoleContent = req.body.role && req.body.content;
     const hasInput = req.body.input && (Array.isArray(req.body.input) || typeof req.body.input === "string");
@@ -419,23 +421,20 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
       });
     }
 
-    const toolsPresent = Array.isArray(req.body?.tools) && req.body.tools.length > 0;
+    const wantStream = req.body.stream === true;
 
-    // If tools are present, do NOT stream (our fake SSE doesn't support tool_calls deltas).
-    // Return JSON so Cursor can see tool_calls.
-    const wantStream = req.body.stream === true && !toolsPresent;
-
-
-    // IMPORTANT: always call Azure in NON-streaming mode
-    req.body.stream = false;
+    // IMPORTANT: always call Azure non-streaming
+    const reqForAzure = { ...req.body, stream: false };
 
     let anthropicRequest;
     try {
-      anthropicRequest = transformRequest(req.body);
+      anthropicRequest = transformRequest(reqForAzure);
       anthropicRequest.stream = false;
     } catch (e) {
       console.error("[ERROR] transformRequest failed:", e);
-      return res.status(400).json({ error: { message: "Failed to transform request: " + e.message, type: "transform_error" } });
+      return res.status(400).json({
+        error: { message: "Failed to transform request: " + e.message, type: "transform_error" },
+      });
     }
 
     console.log("[AZURE] Calling Azure Anthropic API (non-streaming)...");
@@ -460,21 +459,27 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
 
     // Build OpenAI response JSON
     const openAIResponse = transformResponse(response.data, req.body?.model);
-    const choice = openAIResponse?.choices?.[0];
-    const message = choice?.message || { role: "assistant", content: "" };
 
-    // Cursor tolerance: ensure content is a string
+    const choice = openAIResponse?.choices?.[0] || {};
+    const message = choice.message || { role: "assistant", content: "" };
+
+    // Hardening: never null content
     if (message.content == null) message.content = "";
 
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    const hasToolCalls = toolCalls.length > 0;
+
+    // If client did NOT request streaming, return JSON
     if (!wantStream) {
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       console.log("[RESPONSE] Sending JSON response");
       return res.status(200).json(openAIResponse);
     }
 
-    // --- Fake SSE streaming for Cursor (OpenAI-compatible) ---
-    console.log("[RESPONSE] Sending SSE (fake streaming)...");
-    const id = openAIResponse.id || ("chatcmpl-" + Date.now().toString(36));
+    // ---- Streaming SSE response (OpenAI-compatible) ----
+    console.log("[RESPONSE] Sending SSE response");
+
+    const id = openAIResponse.id || ("chatcmpl-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10));
     const created = openAIResponse.created || Math.floor(Date.now() / 1000);
     const model = openAIResponse.model || (req.body?.model || "claude-opus-4-5");
 
@@ -495,15 +500,36 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     };
 
-    // Many clients expect role first
+    // 1) Initial role chunk (many clients expect this)
     send({ role: "assistant" }, null);
 
-    // Stream content as one chunk (simple and compatible)
+    // 2) If there is assistant text, stream it
     if (typeof message.content === "string" && message.content.length) {
       send({ content: message.content }, null);
     }
 
-    // Finish
+    // 3) If there are tool calls, stream them as delta.tool_calls
+    // OpenAI streaming uses tool_calls with an "index" per call
+    if (hasToolCalls) {
+      const streamedToolCalls = toolCalls.map((tc, idx) => ({
+        index: idx,
+        id: tc.id,
+        type: tc.type || "function",
+        function: {
+          name: tc.function?.name,
+          arguments: tc.function?.arguments || "",
+        },
+      }));
+
+      send({ tool_calls: streamedToolCalls }, null);
+
+      // finish as tool_calls so Cursor executes them
+      send({}, "tool_calls");
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
+    // Otherwise normal stop
     send({}, "stop");
     res.write("data: [DONE]\n\n");
     return res.end();
@@ -512,6 +538,7 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
     return res.status(500).json({ error: { message: error.message, type: "proxy_error" } });
   }
 });
+
 
 
 app.post("/v1/chat/completions", requireAuth, (req, res) => {
