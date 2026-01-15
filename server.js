@@ -419,15 +419,14 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
             hasContent,
         });
 
-        const isStreaming = req.body.stream === true;
-        console.log(`[AZURE] Streaming mode: ${isStreaming}`);
-
+        
+        const toolsPresent = Array.isArray(req.body?.tools) && req.body.tools.length > 0;
+        const isStreaming = req.body.stream === true && !toolsPresent;
         // Transform request to Anthropic format
         let anthropicRequest;
         try {
             anthropicRequest = transformRequest(req.body);
-            console.log("[AZURE] Request transformed successfully");
-            console.log("[AZURE] Using model/deployment:", anthropicRequest.model);
+            anthropicRequest.stream = isStreaming;
             // console.log('[AZURE] Transformed request:', JSON.stringify(anthropicRequest, null, 2));
         } catch (transformError) {
             console.error("[ERROR] Failed to transform request:", transformError);
@@ -665,11 +664,12 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
             throw new Error("Azure API key not configured. Set AZURE_API_KEY environment variable.");
         }
 
-        const isStreaming = req.body.stream === true;
-        console.log(`[AZURE] Streaming mode: ${isStreaming}`);
-
-        // Transform request
+        const toolsPresent = Array.isArray(req.body?.tools) && req.body.tools.length > 0;
+        const isStreaming = req.body.stream === true && !toolsPresent;
+        
         const anthropicRequest = transformRequest(req.body);
+        anthropicRequest.stream = isStreaming;
+
         console.log("[AZURE] Calling Azure Anthropic API...");
         console.log("Transformed request:", JSON.stringify(anthropicRequest, null, 2));
 
