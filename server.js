@@ -418,10 +418,12 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
             hasInput,
             hasContent,
         });
+        req.body.stream = false;
+
 
         
-        const toolsPresent = Array.isArray(req.body?.tools) && req.body.tools.length > 0;
-        const isStreaming = req.body.stream === true && !toolsPresent;
+        const isStreaming = false;
+
         // Transform request to Anthropic format
         let anthropicRequest;
         try {
@@ -447,7 +449,7 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
                 "anthropic-version": CONFIG.ANTHROPIC_VERSION,
             },
             timeout: 120000,
-            responseType: isStreaming ? "stream" : "json",
+            responseType: "json",
             validateStatus: function (status) {
                 return status < 600; // Don't throw on any status < 600
             },
@@ -668,7 +670,7 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
         const isStreaming = req.body.stream === true && !toolsPresent;
         
         const anthropicRequest = transformRequest(req.body);
-        anthropicRequest.stream = isStreaming;
+        anthropicRequest.stream = false;
 
         console.log("[AZURE] Calling Azure Anthropic API...");
         console.log("Transformed request:", JSON.stringify(anthropicRequest, null, 2));
@@ -681,7 +683,7 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
                 "anthropic-version": CONFIG.ANTHROPIC_VERSION,
             },
             timeout: 120000,
-            responseType: isStreaming ? "stream" : "json",
+            responseType: "json",
         });
 
         if (isStreaming) {
