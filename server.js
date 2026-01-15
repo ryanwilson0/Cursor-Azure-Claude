@@ -290,6 +290,8 @@ function transformRequest(openAIRequest) {
   const anthTools = openaiToolsToAnthropic(tools);
   if (anthTools.length) anthropicRequest.tools = anthTools;
 
+
+
   const supportedFields = ["metadata", "stop_sequences", "top_p", "top_k"];
   for (const field of supportedFields) {
     if (rest[field] !== undefined) anthropicRequest[field] = rest[field];
@@ -384,6 +386,8 @@ app.get("/health", (req, res) => {
 app.post("/chat/completions", requireAuth, async (req, res) => {
   console.log("[REQUEST /chat/completions]", new Date().toISOString());
   console.log("Model:", req.body?.model, "Stream:", req.body?.stream);
+  console.log("Tools present:", Array.isArray(req.body?.tools) ? req.body.tools.length : 0);
+  console.log("Roles:", Array.isArray(req.body?.messages) ? req.body.messages.map(m => m.role) : []);
 
   try {
     if (!CONFIG.AZURE_API_KEY) {
@@ -416,6 +420,12 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
     }
 
     const wantStream = req.body.stream === true;
+    const toolsPresent = Array.isArray(req.body?.tools) && req.body.tools.length > 0;
+
+    // If tools are present, do NOT stream (our fake SSE doesn't support tool_calls deltas).
+    // Return JSON so Cursor can see tool_calls.
+    const wantStream = req.body.stream === true && !toolsPresent;
+
 
     // IMPORTANT: always call Azure in NON-streaming mode
     req.body.stream = false;
