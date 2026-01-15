@@ -871,6 +871,36 @@ app.post("/v1/*", async (req, res) => {
         });
     }
 });
+// OpenAI-compatible models endpoints (Cursor often calls this to validate provider)
+app.get("/v1/models", requireAuth, (req, res) => {
+  const now = Math.floor(Date.now() / 1000);
+  res.json({
+    object: "list",
+    data: [
+      {
+        id: "claude-opus-4-5",
+        object: "model",
+        created: now,
+        owned_by: "proxy",
+      },
+    ],
+  });
+});
+
+app.get("/models", requireAuth, (req, res) => {
+  const now = Math.floor(Date.now() / 1000);
+  res.json({
+    object: "list",
+    data: [
+      {
+        id: "claude-opus-4-5",
+        object: "model",
+        created: now,
+        owned_by: "proxy",
+      },
+    ],
+  });
+});
 
 // 404 handler
 app.use((req, res) => {
