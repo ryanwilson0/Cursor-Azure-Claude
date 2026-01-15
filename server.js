@@ -131,6 +131,52 @@ function buildToolIdToNameMap(messages) {
   }
   return map;
 }
+function parseCallingToolLines(text) {
+  if (!text || typeof text !== "string") return { tool_calls: [], cleanedText: text || "" };
+
+  const tool_calls = [];
+  const outLines = [];
+
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    const m = line.match(/^\s*Calling\s+([a-zA-Z0-9_]+)\s+([\s\S]+)\s*$/);
+    if (!m) {
+      outLines.push(line);
+      continue;
+    }
+
+    const toolName = m[1];
+    const rest = m[2];
+
+    // Cursor's shell_command tool almost always wants { "command": "..." }
+    let argsObj;
+    if (toolName === "shell_command") {
+      argsObj = { command: rest };
+    } else {
+      // Attempt: if it contains JSON, parse it; else pass as { input: "..." }
+      const jsonStart = rest.indexOf("{");
+      const jsonEnd = rest.lastIndexOf("}");
+      if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
+        const jsonStr = rest.slice(jsonStart, jsonEnd + 1);
+        try {
+          argsObj = JSON.parse(jsonStr);
+        } catch {
+          argsObj = { input: rest };
+        }
+      } else {
+        argsObj = { input: rest };
+      }
+    }
+
+    tool_calls.push({
+      id: "call_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10),
+      type: "function",
+      function: { name: toolName, arguments: JSON.stringify(argsObj) },
+    });
+  }
+
+  return { tool_calls, cleanedText: outLines.join("\n").trim() };
+}
 
 function openaiToolMessageToAnthropicUserMessage(msg, toolIdToName) {
   const toolUseId = msg.tool_call_id || msg.tool_callId || msg.id;
@@ -341,7 +387,7 @@ function transformAzureToOpenAI(azureResp, requestedModel) {
   let cleanedText = text;
 
   if (!toolCalls.length) {
-    const parsed = parseFunctionCallsFromText(text);
+    const parsed = parseCallingToolLines(text);
     toolCalls = parsed.tool_calls;
     cleanedText = parsed.cleanedText;
   } else {
@@ -391,12 +437,15 @@ function sendOpenAISSE(res, openAIResponse) {
   const created = openAIResponse.created || Math.floor(Date.now() / 1000);
   const model = openAIResponse.model || "claude-opus-4-5";
 
-  res.status(200);
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no"); // helps with some proxies
-  res.flushHeaders?.();
+  // IMPORTANT: If handleChatCompletions already started SSE, do NOT set headers again.
+  if (!res.headersSent) {
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+  }
 
   const writeChunk = (delta, finish_reason = null) => {
     const chunk = {
@@ -409,10 +458,10 @@ function sendOpenAISSE(res, openAIResponse) {
     res.write(`data: ${JSON.stringify(chunk)}\n\n`);
   };
 
-  // 1) role chunk FIRST (Cursor expects early bytes)
+  // role chunk (safe to send twice; Cursor tolerates it)
   writeChunk({ role: "assistant" }, null);
 
-  // 2) content chunk(s)
+  // content chunks
   const text = typeof message.content === "string" ? message.content : "";
   if (text.length) {
     const CHUNK = 1500;
@@ -421,7 +470,7 @@ function sendOpenAISSE(res, openAIResponse) {
     }
   }
 
-  // 3) tool_calls streamed in OpenAI incremental shape
+  // tool_calls in incremental OpenAI streaming format (Cursor requires this pattern)
   if (hasToolCalls) {
     const ARG_CHUNK = 1200;
 
@@ -429,9 +478,10 @@ function sendOpenAISSE(res, openAIResponse) {
       const tc = toolCalls[idx];
       const name = tc?.function?.name || "unknown_tool";
       const args = tc?.function?.arguments || "";
-      const tcId = tc?.id || ("call_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10));
+      const tcId =
+        tc?.id || ("call_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10));
 
-      // 3a) announce tool call (name + id) with empty args
+      // announce tool call id/name
       writeChunk(
         {
           tool_calls: [
@@ -446,7 +496,7 @@ function sendOpenAISSE(res, openAIResponse) {
         null
       );
 
-      // 3b) stream arguments in chunks (Cursor tends to require this)
+      // stream arguments in chunks
       for (let i = 0; i < args.length; i += ARG_CHUNK) {
         writeChunk(
           {
@@ -462,17 +512,16 @@ function sendOpenAISSE(res, openAIResponse) {
       }
     }
 
-    // 3c) finish as tool_calls
     writeChunk({}, "tool_calls");
     res.write("data: [DONE]\n\n");
     return res.end();
   }
 
-  // 4) normal stop
   writeChunk({}, "stop");
   res.write("data: [DONE]\n\n");
   return res.end();
 }
+
 
 
 // -------------------- Endpoints --------------------
@@ -538,7 +587,6 @@ async function handleChatCompletions(req, res) {
 
   const wantStream = req.body?.stream === true;
 
-  // We'll start SSE immediately when streaming is requested to avoid Cursor timeouts / buffering.
   let heartbeat = null;
   let sseStarted = false;
 
@@ -546,32 +594,24 @@ async function handleChatCompletions(req, res) {
 
   try {
     if (!CONFIG.AZURE_API_KEY) {
-      return res.status(500).json({
-        error: { message: "Azure API key not configured", type: "configuration_error" },
-      });
+      return res.status(500).json({ error: { message: "Azure API key not configured", type: "configuration_error" } });
     }
     if (!CONFIG.AZURE_ENDPOINT) {
-      return res.status(500).json({
-        error: { message: "Azure endpoint not configured", type: "configuration_error" },
-      });
+      return res.status(500).json({ error: { message: "Azure endpoint not configured", type: "configuration_error" } });
     }
     if (!req.body || !Array.isArray(req.body.messages)) {
-      return res.status(400).json({
-        error: { message: "Invalid request: expected messages[]", type: "invalid_request_error" },
-      });
+      return res.status(400).json({ error: { message: "Invalid request: expected messages[]", type: "invalid_request_error" } });
     }
 
-    // If Cursor requested streaming, open the stream immediately and keep it alive.
-    // Cursor will often show "Empty provider response" if it doesn't see early SSE bytes.
+    // Start SSE immediately to prevent Cursor "Empty provider response"
     if (wantStream) {
       res.status(200);
       res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
       res.setHeader("Cache-Control", "no-cache, no-transform");
       res.setHeader("Connection", "keep-alive");
-      res.setHeader("X-Accel-Buffering", "no"); // helps with buffering proxies
+      res.setHeader("X-Accel-Buffering", "no");
       res.flushHeaders?.();
 
-      // Send an early "role" chunk so Cursor knows the provider is alive.
       const earlyId = makeChatCmplId();
       const created = Math.floor(Date.now() / 1000);
       const model = req.body?.model || "claude-opus-4-5";
@@ -584,15 +624,14 @@ async function handleChatCompletions(req, res) {
         choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
       });
 
-      // Heartbeat ping every 10s while we wait for Azure.
       heartbeat = setInterval(() => {
-        res.write(":\n\n"); // SSE comment line
+        res.write(":\n\n"); // SSE ping
       }, 10000);
 
       sseStarted = true;
     }
 
-    // Always call Azure non-streaming. We stream to Cursor ourselves.
+    // Call Azure non-streaming
     const reqForAzure = { ...req.body, stream: false };
 
     const anthropicRequest = transformRequestToAnthropic(reqForAzure);
@@ -618,24 +657,19 @@ async function handleChatCompletions(req, res) {
 
       if (heartbeat) clearInterval(heartbeat);
 
-      // If we already started SSE, return an SSE-shaped error so Cursor doesn't treat it as empty.
       if (sseStarted) {
-        const created = Math.floor(Date.now() / 1000);
-        const model = req.body?.model || "claude-opus-4-5";
         sseWrite({
           id: makeChatCmplId(),
           object: "chat.completion.chunk",
-          created,
-          model,
+          created: Math.floor(Date.now() / 1000),
+          model: req.body?.model || "claude-opus-4-5",
           choices: [{ index: 0, delta: { content: `Azure error: ${msg}` }, finish_reason: "stop" }],
         });
         res.write("data: [DONE]\n\n");
         return res.end();
       }
 
-      return res.status(response.status).json({
-        error: { message: msg, type: "api_error", code: response.status },
-      });
+      return res.status(response.status).json({ error: { message: msg, type: "api_error", code: response.status } });
     }
 
     const openAIResponse = transformAzureToOpenAI(response.data, req.body?.model);
@@ -646,14 +680,12 @@ async function handleChatCompletions(req, res) {
 
     if (heartbeat) clearInterval(heartbeat);
 
-    // Non-streaming: return JSON
     if (!wantStream) {
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       console.log("[RESPONSE] Sending JSON response");
       return res.status(200).json(openAIResponse);
     }
 
-    // Streaming: stream OpenAI SSE chunks (must be Cursor-friendly)
     console.log("[RESPONSE] Sending SSE response");
     return sendOpenAISSE(res, openAIResponse);
   } catch (e) {
@@ -662,15 +694,12 @@ async function handleChatCompletions(req, res) {
 
     if (heartbeat) clearInterval(heartbeat);
 
-    // If SSE is already open, send an SSE-shaped error + DONE
     if (sseStarted) {
-      const created = Math.floor(Date.now() / 1000);
-      const model = req.body?.model || "claude-opus-4-5";
       sseWrite({
         id: makeChatCmplId(),
         object: "chat.completion.chunk",
-        created,
-        model,
+        created: Math.floor(Date.now() / 1000),
+        model: req.body?.model || "claude-opus-4-5",
         choices: [{ index: 0, delta: { content: `Proxy error: ${msg}` }, finish_reason: "stop" }],
       });
       res.write("data: [DONE]\n\n");
