@@ -574,8 +574,8 @@ app.post("/chat/completions", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/chat/completions", requireAuth, (req, res) => {
-  res.redirect(307, "/v1/chat/completions");
+app.post("/v1/chat/completions", requireAuth, (req, res) => {
+  res.redirect(307, "/chat/completions");
 });
 
 // Anthropic-native endpoint for direct compatibility
