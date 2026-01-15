@@ -299,32 +299,31 @@ function transformRequest(openAIRequest) {
 }
 
 
-// Transform Anthropic response to OpenAI format
 function transformResponse(anthropicResponse) {
-    const { content, id, model, stop_reason, usage } = anthropicResponse;
+  const { content, id, model, stop_reason, usage } = anthropicResponse;
 
-    return {
-        id: id,
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: [
-            {
-                index: 0,
-                message: {
-                    role: "assistant",
-                    content: content[0].text,
-                },
-                finish_reason: stop_reason,
-            },
-        ],
-        usage: {
-            prompt_tokens: usage.input_tokens,
-            completion_tokens: usage.output_tokens,
-            total_tokens: usage.input_tokens + usage.output_tokens,
-        },
-    };
+  const assistantMessage = anthropicContentToOpenAIMessage(content);
+
+  return {
+    id: id,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: model,
+    choices: [
+      {
+        index: 0,
+        message: assistantMessage,
+        finish_reason: stop_reason || "stop",
+      },
+    ],
+    usage: {
+      prompt_tokens: usage?.input_tokens ?? 0,
+      completion_tokens: usage?.output_tokens ?? 0,
+      total_tokens: (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0),
+    },
+  };
 }
+
 
 // Root endpoint
 app.get("/", (req, res) => {
