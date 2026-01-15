@@ -183,14 +183,29 @@ function toAnthropicContentBlocks(content) {
 
 function openaiToolsToAnthropic(tools = []) {
   // OpenAI tools: [{type:"function", function:{name, description, parameters}}]
+  // Cursor tools: [{name, description, parameters}]
   // Anthropic tools: [{name, description, input_schema}]
   return (tools || [])
-    .filter((t) => t?.type === "function" && t.function?.name)
-    .map((t) => ({
-      name: t.function.name,
-      description: t.function.description || "",
-      input_schema: t.function.parameters || { type: "object", properties: {} },
-    }));
+    .map((t) => {
+      if (t?.type === "function" && t.function?.name) {
+        return {
+          name: t.function.name,
+          description: t.function.description || "",
+          input_schema: t.function.parameters || { type: "object", properties: {} },
+        };
+      }
+
+      if (t?.name) {
+        return {
+          name: t.name,
+          description: t.description || "",
+          input_schema: t.parameters || { type: "object", properties: {} },
+        };
+      }
+
+      return null;
+    })
+    .filter(Boolean);
 }
 
 function getToolNameSet(reqBody) {
@@ -284,7 +299,17 @@ Rules:
 - Do NOT claim tool success unless you output an <invoke ...> block.
 - Put only the tool calls inside <function_calls> ... </function_calls>.
 - Use ONLY tool names from AVAILABLE_TOOLS (exact spelling).
-- If the user asks to edit a file, you should usually call a read/view tool first, then an edit tool.
+- If the user asks to edit a file, you MUST call a read/view tool first, then an edit tool.
+  `.trim();
+}
+
+// test: cursor edit tool check
+function buildEditToolInstruction() {
+  return `
+If the user asks to modify a file, you MUST respond with a <function_calls> block invoking Edit.
+Do NOT say "I will edit" without emitting the tool call.
+Use parameter name "path" (not "file_path").
+After receiving the tool result, verify by calling Read.
   `.trim();
 }
 
@@ -500,7 +525,8 @@ function transformRequestToAnthropic(openAIRequest) {
 
   // CRITICAL FIX: append our tool instruction LAST so it overrides any earlier system prompt text
   const toolInstruction = buildToolCallInstruction(toolNamesList);
-  const systemFinal = [...systemTextParts, toolInstruction].filter(Boolean).join("\n\n");
+  const editInstruction = buildEditToolInstruction();
+  const systemFinal = [...systemTextParts, toolInstruction, editInstruction].filter(Boolean).join("\n\n");
 
   const anthropicRequest = {
     model: azureModelName,
@@ -743,6 +769,16 @@ async function handleChatCompletions(req, res) {
     const reqForAzure = { ...req.body, stream: false };
     const anthropicRequest = transformRequestToAnthropic(reqForAzure);
     anthropicRequest.stream = false;
+
+    if (String(process.env.DEBUG_TOOLS || "false").toLowerCase() === "true") {
+      console.log(`[${reqId}] [DEBUG] anthropic_tools_count=${anthropicRequest.tools?.length || 0}`);
+    }
+
+    if (String(process.env.DEBUG_TOOL_SCHEMA || "false").toLowerCase() === "true") {
+      const tools = Array.isArray(req.body?.tools) ? req.body.tools : [];
+      const pick = tools.filter((t) => (t?.name || t?.function?.name) === "Edit");
+      console.log(`[${reqId}] [DEBUG] cursor_Edit_tool_schema=` + JSON.stringify(pick, null, 2));
+    }
 
     console.log(`[${reqId}] [AZURE] POST ${CONFIG.AZURE_ENDPOINT}`);
     const response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
