@@ -8,7 +8,7 @@
  *   * We strongly instruct the model to emit Cursor XML tool-call markup (<function_calls>...</function_calls>)
  *   * We parse that into OpenAI tool_calls so Cursor actually executes tools.
  *   * If Azure ever returns native Anthropic tool_use blocks, we convert them too.
- *   * Fallback: parse "Calling read_file on ... with lines ..." lines.
+ *   * Fallback: parse "Calling read_file on ... with lines ..." lines (weak fallback).
  */
 
 const express = require("express");
@@ -138,23 +138,6 @@ function openaiToolsToAnthropic(tools = []) {
     }));
 }
 
-function buildToolIdToNameMap(messages) {
-  const map = new Map();
-  if (!Array.isArray(messages)) return map;
-
-  for (const m of messages) {
-    if (!m || m.role !== "assistant") continue;
-    if (Array.isArray(m.tool_calls)) {
-      for (const tc of m.tool_calls) {
-        const id = tc?.id;
-        const name = tc?.function?.name;
-        if (id && name) map.set(id, name);
-      }
-    }
-  }
-  return map;
-}
-
 function getToolNameSet(reqBody) {
   const set = new Set();
   const tools = Array.isArray(reqBody?.tools) ? reqBody.tools : [];
@@ -175,6 +158,23 @@ function getToolParamSchemaMap(reqBody) {
     if (!name) continue;
     if (props && typeof props === "object") map.set(name, Object.keys(props));
     else map.set(name, []);
+  }
+  return map;
+}
+
+function buildToolIdToNameMap(messages) {
+  const map = new Map();
+  if (!Array.isArray(messages)) return map;
+
+  for (const m of messages) {
+    if (!m || m.role !== "assistant") continue;
+    if (Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        const id = tc?.id;
+        const name = tc?.function?.name;
+        if (id && name) map.set(id, name);
+      }
+    }
   }
   return map;
 }
@@ -202,11 +202,17 @@ function safeParseValue(v) {
 }
 
 /**
- * IMPORTANT:
- * Cursor tool execution is most reliable when the assistant produces structured tool calls.
- * We enforce a strict XML tool-call format that we can parse into OpenAI tool_calls.
+ * Tool-call discipline instruction.
+ * CRITICAL: This MUST be appended LAST in the system prompt so Cursor’s system prompt does not override it.
  */
-const TOOL_CALL_INSTRUCTION = `
+function buildToolCallInstruction(toolNamesList) {
+  const names = Array.isArray(toolNamesList) && toolNamesList.length ? toolNamesList.join(", ") : "(none)";
+  return `
+AVAILABLE_TOOLS: ${names}
+
+When the user asks to read, inspect, modify, or verify files (or you need files to answer), you MUST call the appropriate tool.
+You are NOT allowed to claim you read or edited a file unless you actually called a tool.
+
 When you need to use a tool, you MUST output tool calls ONLY in this exact XML format, with NO extra wrappers:
 
 <function_calls>
@@ -218,14 +224,15 @@ When you need to use a tool, you MUST output tool calls ONLY in this exact XML f
 
 Rules:
 - Do NOT write "Calling read_file ..." lines.
-- Do NOT claim you ran a tool unless you output an <invoke ...> block.
+- Do NOT claim tool success unless you output an <invoke ...> block.
 - Put only the tool calls inside <function_calls> ... </function_calls>.
-- After tool results are returned, continue normally.
-`.trim();
+- Use ONLY tool names from AVAILABLE_TOOLS (exact spelling).
+- If the user asks to edit a file, you should usually call a read/view tool first, then an edit tool.
+  `.trim();
+}
 
 function openaiToolMessageToAnthropicUserMessage(msg, toolIdToName) {
-  // Cursor sends tool results as role=tool with tool_call_id + content.
-  // Azure may not honor Anthropic tool_result blocks reliably, so we inject results as user-visible text.
+  // Cursor tool result -> inject into Anthropic as plain user text for robustness
   const toolUseId = msg.tool_call_id || msg.tool_callId || msg.id;
   const toolName = toolUseId ? toolIdToName.get(toolUseId) : null;
 
@@ -262,7 +269,6 @@ function parseFunctionCallsFromText(text, allowedToolNames) {
   const fcStart = cleaned.indexOf("<function_calls>");
   const fcEnd = cleaned.indexOf("</function_calls>");
   if (fcStart === -1 || fcEnd === -1 || fcEnd <= fcStart) {
-    // Strip thinking tags anyway
     cleaned = cleaned.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "").trim();
     return { tool_calls: [], cleanedText: cleaned };
   }
@@ -321,18 +327,12 @@ function parseCallingLineToolCalls(text, allowedToolNames, toolParamSchemaMap) {
   const lines = cleaned.split(/\r?\n/);
   const out = [];
 
-  // Example patterns we try to handle:
-  // "Calling read_file on backend/foo.py with lines 245 to 290"
-  // "Calling view_file on /abs/path with lines 10-50"
-  // "Calling shell_command cat /path | head -20"
   const callRe1 = /^\s*Calling\s+([A-Za-z0-9_-]+)\s+on\s+(.+?)\s+with\s+lines\s+(\d+)\s*(?:to|-)\s*(\d+)\s*$/i;
   const callRe2 = /^\s*Calling\s+shell_command\s+(.+)\s*$/i;
-  const callRe3 = /^\s*Calling\s+([A-Za-z0-9_-]+)\s+(.+)\s*$/i;
 
   for (const line of lines) {
     let m;
 
-    // shell_command direct
     m = line.match(callRe2);
     if (m) {
       const cmd = (m[1] || "").trim();
@@ -342,7 +342,6 @@ function parseCallingLineToolCalls(text, allowedToolNames, toolParamSchemaMap) {
       }
     }
 
-    // read/view_file with lines
     m = line.match(callRe1);
     if (m) {
       const toolName = (m[1] || "").trim();
@@ -353,12 +352,9 @@ function parseCallingLineToolCalls(text, allowedToolNames, toolParamSchemaMap) {
       if (isAllowed(toolName)) {
         const keys = toolParamSchemaMap.get(toolName) || [];
 
-        const pathKey =
-          pickFirstKey(keys, ["file_path", "path", "filepath", "filename", "file"]) || "file_path";
-        const startKey =
-          pickFirstKey(keys, ["start_line", "startLine", "from_line", "line_start", "start"]) || "start_line";
-        const endKey =
-          pickFirstKey(keys, ["end_line", "endLine", "to_line", "line_end", "end"]) || "end_line";
+        const pathKey = pickFirstKey(keys, ["file_path", "path", "filepath", "filename", "file"]) || "file_path";
+        const startKey = pickFirstKey(keys, ["start_line", "startLine", "from_line", "line_start", "start"]) || "start_line";
+        const endKey = pickFirstKey(keys, ["end_line", "endLine", "to_line", "line_end", "end"]) || "end_line";
 
         const args = {};
         args[pathKey] = path;
@@ -370,21 +366,6 @@ function parseCallingLineToolCalls(text, allowedToolNames, toolParamSchemaMap) {
       }
     }
 
-    // generic "Calling X ..." (weak)
-    m = line.match(callRe3);
-    if (m) {
-      const toolName = (m[1] || "").trim();
-      const rest = (m[2] || "").trim();
-      if (isAllowed(toolName)) {
-        if (toolName === "shell_command") {
-          tool_calls.push(mkToolCall("shell_command", { command: rest }));
-          continue;
-        }
-        // For unknown formats, we do not create a tool call because args will almost certainly be wrong.
-        // Keep line visible.
-      }
-    }
-
     out.push(line);
   }
 
@@ -392,7 +373,7 @@ function parseCallingLineToolCalls(text, allowedToolNames, toolParamSchemaMap) {
   return { tool_calls, cleanedText: cleaned };
 }
 
-// Convert Anthropic content blocks (if Azure ever returns tool_use)
+// Convert Anthropic content blocks (if Azure returns tool_use)
 function anthropicContentToTextAndToolCalls(anthropicContent) {
   const textParts = [];
   const toolCalls = [];
@@ -430,6 +411,9 @@ function transformRequestToAnthropic(openAIRequest) {
   const { messages, model, max_tokens, temperature, tools, ...rest } = openAIRequest;
 
   const toolIdToName = buildToolIdToNameMap(messages);
+  const toolNamesList = (Array.isArray(tools) ? tools : [])
+    .map((t) => t?.function?.name || t?.name)
+    .filter(Boolean);
 
   let anthropicMessages = [];
   let systemTextParts = [];
@@ -457,8 +441,9 @@ function transformRequestToAnthropic(openAIRequest) {
 
   const azureModelName = mapModelToDeployment(model);
 
-  // Prepend our tool-call discipline instruction to system prompt.
-  const systemFinal = [TOOL_CALL_INSTRUCTION, ...systemTextParts].filter(Boolean).join("\n\n");
+  // CRITICAL FIX: append our tool instruction LAST so it overrides any earlier system prompt text
+  const toolInstruction = buildToolCallInstruction(toolNamesList);
+  const systemFinal = [...systemTextParts, toolInstruction].filter(Boolean).join("\n\n");
 
   const anthropicRequest = {
     model: azureModelName,
@@ -469,11 +454,9 @@ function transformRequestToAnthropic(openAIRequest) {
 
   if (temperature !== undefined) anthropicRequest.temperature = temperature;
 
-  // Try passing tools through. If Azure ignores them, we still parse XML.
   const anthTools = openaiToolsToAnthropic(tools);
   if (anthTools.length) anthropicRequest.tools = anthTools;
 
-  // Copy a small set of supported fields
   const supportedFields = ["metadata", "stop_sequences", "top_p", "top_k"];
   for (const f of supportedFields) {
     if (rest[f] !== undefined) anthropicRequest[f] = rest[f];
@@ -485,28 +468,24 @@ function transformRequestToAnthropic(openAIRequest) {
 function transformAzureToOpenAI(azureResp, requestedModel, allowedToolNames, toolParamSchemaMap) {
   const { content, stop_reason, usage } = azureResp || {};
 
-  // 1) Native tool_use blocks
   const native = anthropicContentToTextAndToolCalls(content);
   let text = native.text || "";
   let toolCalls = native.tool_calls || [];
 
-  // 2) If no native tool_use, parse XML tool calls
   let extractedToolCalls = [];
+  let extractedCalling = [];
+
   if (!toolCalls.length) {
     const parsedXml = parseFunctionCallsFromText(text, allowedToolNames);
     extractedToolCalls = parsedXml.tool_calls;
     text = parsedXml.cleanedText;
-
     if (extractedToolCalls.length) toolCalls = extractedToolCalls;
   }
 
-  // 3) Fallback parse "Calling ... on ... with lines ..."
-  let extractedCalling = [];
   if (!toolCalls.length) {
     const parsedCalling = parseCallingLineToolCalls(text, allowedToolNames, toolParamSchemaMap);
     extractedCalling = parsedCalling.tool_calls;
     text = parsedCalling.cleanedText;
-
     if (extractedCalling.length) toolCalls = extractedCalling;
   }
 
@@ -518,7 +497,7 @@ function transformAzureToOpenAI(azureResp, requestedModel, allowedToolNames, too
   };
   if (hasToolCalls) msg.tool_calls = toolCalls;
 
-  const openaiResp = {
+  return {
     id: makeChatCmplId(),
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
@@ -541,8 +520,6 @@ function transformAzureToOpenAI(azureResp, requestedModel, allowedToolNames, too
       extracted_tool_calls: extractedToolCalls.length || extractedCalling.length || 0,
     },
   };
-
-  return openaiResp;
 }
 
 // ---------- SSE (OpenAI streaming) ----------
@@ -568,12 +545,8 @@ function createSSE(reqId, res, model) {
 
   res.on("close", () => {
     closed = true;
-    // Distinguish early client close vs normal close after end()
-    if (!finished && !res.writableEnded) {
-      console.log(`[${reqId}] [DEBUG] response_closed_early_by_client`);
-    } else {
-      console.log(`[${reqId}] [DEBUG] response_closed`);
-    }
+    if (!finished && !res.writableEnded) console.log(`[${reqId}] [DEBUG] response_closed_early_by_client`);
+    else console.log(`[${reqId}] [DEBUG] response_closed`);
   });
 
   const writeChunk = (delta, finish_reason = null) => {
@@ -596,26 +569,14 @@ function createSSE(reqId, res, model) {
   };
 
   const error = (message) => {
-    // Send an assistant-visible error and terminate cleanly.
     writeChunk({ content: message ? String(message) : "Proxy error" }, null);
     done("stop");
   };
 
-  return {
-    id,
-    created,
-    model: m,
-    writeChunk,
-    done,
-    error,
-    isClosed: () => closed || res.destroyed || res.writableEnded,
-  };
+  return { writeChunk, done, error, isClosed: () => closed || res.destroyed || res.writableEnded };
 }
 
 function sseSendToolCalls(reqId, sse, toolCalls) {
-  // OpenAI streaming tool_calls format is picky:
-  // 1) announce id/name with empty arguments
-  // 2) stream arguments in chunks for that same index
   const ARG_CHUNK = 900;
 
   for (let idx = 0; idx < toolCalls.length; idx++) {
@@ -626,30 +587,20 @@ function sseSendToolCalls(reqId, sse, toolCalls) {
 
     console.log(`[${reqId}] [SSE] tool_call idx=${idx} name=${name} id=${tcId} args_len=${args.length}`);
 
-    // declare call
     sse.writeChunk(
       {
         tool_calls: [
-          {
-            index: idx,
-            id: tcId,
-            type: "function",
-            function: { name, arguments: "" },
-          },
+          { index: idx, id: tcId, type: "function", function: { name, arguments: "" } },
         ],
       },
       null
     );
 
-    // stream args
     for (let i = 0; i < args.length; i += ARG_CHUNK) {
       sse.writeChunk(
         {
           tool_calls: [
-            {
-              index: idx,
-              function: { arguments: args.slice(i, i + ARG_CHUNK) },
-            },
+            { index: idx, function: { arguments: args.slice(i, i + ARG_CHUNK) } },
           ],
         },
         null
@@ -684,7 +635,6 @@ async function handleChatCompletions(req, res) {
   let sse = null;
   let keepalive = null;
 
-  // True abort signal (client aborts request). This is NOT the same as req "close".
   req.on("aborted", () => {
     console.log(`[${reqId}] [DEBUG] request_aborted_by_client`);
     if (keepalive) clearInterval(keepalive);
@@ -719,14 +669,10 @@ async function handleChatCompletions(req, res) {
       return res.status(400).json({ error: { message: msg, type: "invalid_request_error" } });
     }
 
-    // If streaming, start SSE immediately so Cursor doesn't time out.
     if (wantStream) {
       sse = createSSE(reqId, res, requestedModel);
-
-      // initial role chunk
       sse.writeChunk({ role: "assistant" }, null);
 
-      // keepalive as real SSE data chunks (not comments)
       keepalive = setInterval(() => {
         try {
           if (!sse.isClosed()) sse.writeChunk({}, null);
@@ -737,9 +683,7 @@ async function handleChatCompletions(req, res) {
       }, 15000);
     }
 
-    // Always call Azure non-streaming.
     const reqForAzure = { ...req.body, stream: false };
-
     const anthropicRequest = transformRequestToAnthropic(reqForAzure);
     anthropicRequest.stream = false;
 
@@ -776,52 +720,51 @@ async function handleChatCompletions(req, res) {
       } catch (_) {}
     }
 
-    const openAIResponse = transformAzureToOpenAI(
-      response.data,
-      requestedModel,
-      allowedToolNames,
-      toolParamSchemaMap
-    );
+    const openAIResponse = transformAzureToOpenAI(response.data, requestedModel, allowedToolNames, toolParamSchemaMap);
 
     const dbg = openAIResponse._debug || {};
-    const toolCalls = openAIResponse?.choices?.[0]?.message?.tool_calls || [];
+    const msg0 = openAIResponse?.choices?.[0]?.message || { role: "assistant", content: "" };
+    const toolCalls = Array.isArray(msg0.tool_calls) ? msg0.tool_calls : [];
     const toolNames = toolCalls.map((tc) => tc?.function?.name).filter(Boolean);
+
+    const contentStr = typeof msg0.content === "string" ? msg0.content : "";
+    const hasXml = contentStr.includes("<function_calls>") || contentStr.includes("<invoke ");
+    const hasCalling = /\bCalling\s+[A-Za-z0-9_-]+\b/.test(contentStr);
 
     console.log(
       `[${reqId}] [DEBUG] stop_reason=${dbg.stop_reason} native_tool_calls=${dbg.native_tool_calls} extracted_tool_calls=${dbg.extracted_tool_calls}`
     );
+    console.log(`[${reqId}] [DEBUG] assistant_has_xml=${hasXml} assistant_has_calling_line=${hasCalling} tool_calls=${toolCalls.length}`);
     if (toolNames.length) console.log(`[${reqId}] [DEBUG] tool_call_names=${toolNames.join(",")}`);
 
-    // Non-streaming JSON response
+    if (CONFIG.DEBUG_LOG_BODY) {
+      const head = contentStr.replace(/\s+/g, " ").slice(0, 500);
+      console.log(`[${reqId}] [DEBUG] assistant_content_head="${head}"`);
+    }
+
     if (!wantStream) {
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       console.log(`[${reqId}] [RESPONSE] Sending JSON`);
-      // Remove internal debug field for clients (optional; comment out to keep)
       delete openAIResponse._debug;
       return res.status(200).json(openAIResponse);
     }
 
-    // Streaming SSE response
     console.log(`[${reqId}] [RESPONSE] Sending SSE`);
 
     if (!sse) sse = createSSE(reqId, res, requestedModel);
 
-    const msg0 = openAIResponse?.choices?.[0]?.message || { role: "assistant", content: "" };
     const text = typeof msg0.content === "string" ? msg0.content : "";
-    const hasToolCalls = Array.isArray(msg0.tool_calls) && msg0.tool_calls.length > 0;
+    const hasToolCalls = toolCalls.length > 0;
 
-    // Stream content (if any)
     if (text.length) {
-      // Chunk text to avoid huge single event
       const CHUNK = 1500;
       for (let i = 0; i < text.length; i += CHUNK) {
         sse.writeChunk({ content: text.slice(i, i + CHUNK) }, null);
       }
     }
 
-    // Stream tool calls (if any)
     if (hasToolCalls) {
-      sseSendToolCalls(reqId, sse, msg0.tool_calls);
+      sseSendToolCalls(reqId, sse, toolCalls);
       sse.done("tool_calls");
       return;
     }
@@ -833,7 +776,6 @@ async function handleChatCompletions(req, res) {
     const errMsg = e?.message || String(e);
     console.error(`[${reqId}] [ERROR] /chat/completions exception: ${errMsg}`);
 
-    // If streaming already started, cannot send JSON
     if (wantStream) {
       try {
         if (!sse) sse = createSSE(reqId, res, requestedModel);
@@ -883,7 +825,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-// OpenAI-compatible models endpoints (Cursor often calls this)
 app.get("/v1/models", requireAuth, (req, res) => {
   const now = Math.floor(Date.now() / 1000);
   res.json({
@@ -894,6 +835,7 @@ app.get("/v1/models", requireAuth, (req, res) => {
     ],
   });
 });
+
 app.get("/models", requireAuth, (req, res) => {
   const now = Math.floor(Date.now() / 1000);
   res.json({
@@ -905,12 +847,10 @@ app.get("/models", requireAuth, (req, res) => {
   });
 });
 
-// Cursor uses this
 app.post("/chat/completions", requireAuth, handleChatCompletions);
-// Some clients call this
 app.post("/v1/chat/completions", requireAuth, handleChatCompletions);
 
-// Optional: Anthropic-native passthrough for debugging
+// Optional passthrough for debugging
 app.post("/v1/messages", async (req, res) => {
   try {
     if (!CONFIG.AZURE_API_KEY) throw new Error("Azure API key not configured");
@@ -933,7 +873,6 @@ app.post("/v1/messages", async (req, res) => {
   }
 });
 
-// 404
 app.use((req, res) => {
   res.status(404).json({
     error: {
@@ -943,7 +882,6 @@ app.use((req, res) => {
   });
 });
 
-// Start
 app.listen(CONFIG.PORT, "0.0.0.0", () => {
   console.log("\n" + "=".repeat(80));
   console.log("Azure Anthropic Proxy - Running");
@@ -963,4 +901,3 @@ app.listen(CONFIG.PORT, "0.0.0.0", () => {
   console.log("  POST /v1/messages");
   console.log("=".repeat(80) + "\n");
 });
-
