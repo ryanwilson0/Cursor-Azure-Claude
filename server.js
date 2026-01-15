@@ -689,6 +689,7 @@ async function handleChatCompletions(req, res) {
       if (keepalive) clearInterval(keepalive);
       console.log(`[${reqId}] [DEBUG] response_closed_by_client`);
     });
+  }
 
     // If the client aborts the request mid-flight, this is a true abort signal.
     req.on("aborted", () => {
