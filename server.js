@@ -36,6 +36,8 @@ const CONFIG = {
   PORT: process.env.PORT || 8080,
   ANTHROPIC_VERSION: process.env.ANTHROPIC_VERSION || "2023-06-01",
   AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || "claude-opus-4-5",
+  AZURE_DEPLOYMENT_NAME_SONNET: process.env.AZURE_DEPLOYMENT_NAME_SONNET || "claude-sonnet-4-5",
+
   DEBUG_LOG_BODY: String(process.env.DEBUG_LOG_BODY || "false").toLowerCase() === "true",
 };
 
@@ -109,6 +111,8 @@ function normalizeToolCallsForCursor(toolCalls) {
 
 function mapModelToDeployment(modelName) {
   if (!modelName) return CONFIG.AZURE_DEPLOYMENT_NAME;
+  if (modelName === "claude-sonnet-4-5") return CONFIG.AZURE_SONNET_DEPLOYMENT_NAME;
+  if (modelName === "sonnet-4-5") return CONFIG.AZURE_SONNET_DEPLOYMENT_NAME;
   if (MODEL_NAMES_TO_MAP.includes(modelName)) return CONFIG.AZURE_DEPLOYMENT_NAME;
   if (process.env.AZURE_DEPLOYMENT_NAME) return CONFIG.AZURE_DEPLOYMENT_NAME;
   return modelName;
@@ -897,6 +901,7 @@ app.get("/", (req, res) => {
       SERVICE_API_KEY_set: !!CONFIG.SERVICE_API_KEY,
       ANTHROPIC_VERSION: CONFIG.ANTHROPIC_VERSION,
       AZURE_DEPLOYMENT_NAME: CONFIG.AZURE_DEPLOYMENT_NAME,
+      AZURE_DEPLOYMENT_NAME_SONNET: CONFIG.AZURE_DEPLOYMENT_NAME_SONNET,
       DEBUG_LOG_BODY: CONFIG.DEBUG_LOG_BODY,
     },
     endpoints: {
