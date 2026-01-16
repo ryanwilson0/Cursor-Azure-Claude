@@ -24,7 +24,9 @@ app.use(express.json({ limit: "50mb" }));
  * - SERVICE_API_KEY  (what you paste into Cursor "OpenAI API Key")
  *
  * Optional:
- * - AZURE_DEPLOYMENT_NAME (defaults to "claude-opus-4-5")
+ * - AZURE_DEPLOYMENT_OPUS (deployment name for claude-opus-4-5)
+ * - AZURE_DEPLOYMENT_SONNET (deployment name for claude-sonnet-4-5)
+ * - AZURE_DEPLOYMENT_NAME (fallback deployment name; defaults to "claude-opus-4-5")
  * - ANTHROPIC_VERSION (defaults to "2023-06-01")
  * - PORT (defaults to 8080)
  * - DEBUG_LOG_BODY ("true" to log request/response bodies; be careful)
@@ -36,7 +38,8 @@ const CONFIG = {
   PORT: process.env.PORT || 8080,
   ANTHROPIC_VERSION: process.env.ANTHROPIC_VERSION || "2023-06-01",
   AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || "claude-opus-4-5",
-  AZURE_DEPLOYMENT_NAME_SONNET: process.env.AZURE_DEPLOYMENT_NAME_SONNET || "claude-sonnet-4-5",
+  AZURE_DEPLOYMENT_OPUS: process.env.AZURE_DEPLOYMENT_OPUS || process.env.AZURE_DEPLOYMENT_NAME || "claude-opus-4-5",
+  AZURE_DEPLOYMENT_SONNET: process.env.AZURE_DEPLOYMENT_SONNET || process.env.AZURE_DEPLOYMENT_NAME_SONNET || "",
 
   DEBUG_LOG_BODY: String(process.env.DEBUG_LOG_BODY || "false").toLowerCase() === "true",
 };
@@ -109,13 +112,17 @@ function normalizeToolCallsForCursor(toolCalls) {
   });
 }
 
-function mapModelToDeployment(modelName) {
-  if (!modelName) return CONFIG.AZURE_DEPLOYMENT_NAME;
-  if (modelName === "claude-sonnet-4-5") return CONFIG.AZURE_SONNET_DEPLOYMENT_NAME;
-  if (modelName === "sonnet-4-5") return CONFIG.AZURE_SONNET_DEPLOYMENT_NAME;
-  if (MODEL_NAMES_TO_MAP.includes(modelName)) return CONFIG.AZURE_DEPLOYMENT_NAME;
-  if (process.env.AZURE_DEPLOYMENT_NAME) return CONFIG.AZURE_DEPLOYMENT_NAME;
-  return modelName;
+function mapModelToAzureDeployment(requestedModel) {
+  const normalized = typeof requestedModel === "string" ? requestedModel.trim() : "";
+  const fallback = CONFIG.AZURE_DEPLOYMENT_NAME || CONFIG.AZURE_DEPLOYMENT_OPUS || normalized;
+
+  if (!normalized) return fallback;
+  if (normalized === "claude-opus-4-5") return CONFIG.AZURE_DEPLOYMENT_OPUS || fallback;
+  if (normalized === "claude-sonnet-4-5" || normalized === "sonnet-4-5") {
+    return CONFIG.AZURE_DEPLOYMENT_SONNET || fallback;
+  }
+  if (MODEL_NAMES_TO_MAP.includes(normalized)) return fallback;
+  return fallback;
 }
 
 function makeReqId() {
@@ -525,7 +532,7 @@ function transformRequestToAnthropic(openAIRequest) {
 
   if (!anthropicMessages.length) throw new Error("Invalid request: no messages");
 
-  const azureModelName = mapModelToDeployment(model);
+  const azureModelName = mapModelToAzureDeployment(model);
 
   // CRITICAL FIX: append our tool instruction LAST so it overrides any earlier system prompt text
   const toolInstruction = buildToolCallInstruction(toolNamesList);
@@ -701,12 +708,14 @@ async function handleChatCompletions(req, res) {
   const reqId = makeReqId();
   const requestedModel = req.body?.model || "claude-opus-4-5";
   const wantStream = req.body?.stream === true;
+  const mappedDeployment = mapModelToAzureDeployment(requestedModel);
 
   const toolsCount = Array.isArray(req.body?.tools) ? req.body.tools.length : 0;
   const roles = Array.isArray(req.body?.messages) ? req.body.messages.map((m) => m.role).join(",") : "";
 
   console.log(`[${reqId}] [REQUEST /chat/completions] ${new Date().toISOString()}`);
   console.log(`[${reqId}] Model=${requestedModel} Stream=${wantStream}`);
+  console.log(`[${reqId}] MappedModel=${mappedDeployment} Type=${typeof mappedDeployment}`);
   console.log(`[${reqId}] Tools present=${toolsCount}`);
   console.log(`[${reqId}] Roles=${roles}`);
 
@@ -774,6 +783,27 @@ async function handleChatCompletions(req, res) {
     const anthropicRequest = transformRequestToAnthropic(reqForAzure);
     anthropicRequest.stream = false;
 
+    const opusDeployment = CONFIG.AZURE_DEPLOYMENT_OPUS || CONFIG.AZURE_DEPLOYMENT_NAME;
+    if (
+      typeof requestedModel === "string" &&
+      requestedModel.toLowerCase().includes("sonnet") &&
+      CONFIG.AZURE_DEPLOYMENT_SONNET &&
+      anthropicRequest.model === opusDeployment
+    ) {
+      console.warn(
+        `[${reqId}] [WARN] sonnet_request_mapped_to_opus requestedModel=${requestedModel} mapped=${anthropicRequest.model}`
+      );
+    }
+
+    if (typeof anthropicRequest.model !== "string" || !anthropicRequest.model.trim()) {
+      console.error(
+        `[${reqId}] [ERROR] invalid_anthropic_model requestedModel=${requestedModel} mapped=${anthropicRequest.model}`
+      );
+      throw new Error(
+        `Invalid Azure model mapping. requestedModel=${requestedModel} mapped=${anthropicRequest.model}`
+      );
+    }
+
     if (String(process.env.DEBUG_TOOLS || "false").toLowerCase() === "true") {
       console.log(`[${reqId}] [DEBUG] anthropic_tools_count=${anthropicRequest.tools?.length || 0}`);
     }
@@ -785,6 +815,7 @@ async function handleChatCompletions(req, res) {
     }
 
     console.log(`[${reqId}] [AZURE] POST ${CONFIG.AZURE_ENDPOINT}`);
+    console.log(`[${reqId}] [AZURE] outbound_keys=${Object.keys(anthropicRequest).join(",")}`);
     const response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
       headers: {
         "Content-Type": "application/json",
@@ -796,7 +827,7 @@ async function handleChatCompletions(req, res) {
       validateStatus: (s) => s < 600,
     });
 
-    console.log(`[${reqId}] [AZURE] Response status=${response.status}`);
+    console.log(`[${reqId}] [AZURE] Response status=${response.status} model=${response.data?.model || "unknown"}`);
 
     if (keepalive) clearInterval(keepalive);
 
@@ -901,7 +932,8 @@ app.get("/", (req, res) => {
       SERVICE_API_KEY_set: !!CONFIG.SERVICE_API_KEY,
       ANTHROPIC_VERSION: CONFIG.ANTHROPIC_VERSION,
       AZURE_DEPLOYMENT_NAME: CONFIG.AZURE_DEPLOYMENT_NAME,
-      AZURE_DEPLOYMENT_NAME_SONNET: CONFIG.AZURE_DEPLOYMENT_NAME_SONNET,
+      AZURE_DEPLOYMENT_OPUS: CONFIG.AZURE_DEPLOYMENT_OPUS,
+      AZURE_DEPLOYMENT_SONNET: CONFIG.AZURE_DEPLOYMENT_SONNET,
       DEBUG_LOG_BODY: CONFIG.DEBUG_LOG_BODY,
     },
     endpoints: {
@@ -991,6 +1023,8 @@ app.listen(CONFIG.PORT, "0.0.0.0", () => {
   console.log(`SERVICE_API_KEY set: ${!!CONFIG.SERVICE_API_KEY}`);
   console.log(`ANTHROPIC_VERSION: ${CONFIG.ANTHROPIC_VERSION}`);
   console.log(`AZURE_DEPLOYMENT_NAME: ${CONFIG.AZURE_DEPLOYMENT_NAME}`);
+  console.log(`AZURE_DEPLOYMENT_OPUS: ${CONFIG.AZURE_DEPLOYMENT_OPUS}`);
+  console.log(`AZURE_DEPLOYMENT_SONNET: ${CONFIG.AZURE_DEPLOYMENT_SONNET}`);
   console.log(`DEBUG_LOG_BODY: ${CONFIG.DEBUG_LOG_BODY}`);
   console.log("Endpoints:");
   console.log("  GET  /health");
