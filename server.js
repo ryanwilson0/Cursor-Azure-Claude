@@ -56,6 +56,14 @@ const MODEL_NAMES_TO_MAP = [
   "claude-3-sonnet",
   "claude-3-haiku",
 ];
+
+const SONNET_1M_BETA_HEADER = "context-1m-2025-08-07";
+
+function isSonnet45Model(modelName) {
+  if (typeof modelName !== "string") return false;
+  const normalized = modelName.trim().toLowerCase();
+  return normalized.includes("sonnet-4-5") || normalized.includes("claude-sonnet-4-5");
+}
 function normalizeArgsForCursorTools(toolName, args) {
   if (!args || typeof args !== "object") return args;
 
@@ -816,12 +824,16 @@ async function handleChatCompletions(req, res) {
 
     console.log(`[${reqId}] [AZURE] POST ${CONFIG.AZURE_ENDPOINT}`);
     console.log(`[${reqId}] [AZURE] outbound_keys=${Object.keys(anthropicRequest).join(",")}`);
+    const requestHeaders = {
+      "Content-Type": "application/json",
+      "x-api-key": CONFIG.AZURE_API_KEY,
+      "anthropic-version": CONFIG.ANTHROPIC_VERSION,
+    };
+    if (isSonnet45Model(requestedModel)) {
+      requestHeaders["anthropic-beta"] = SONNET_1M_BETA_HEADER;
+    }
     const response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": CONFIG.AZURE_API_KEY,
-        "anthropic-version": CONFIG.ANTHROPIC_VERSION,
-      },
+      headers: requestHeaders,
       timeout: 120000,
       responseType: "json",
       validateStatus: (s) => s < 600,
@@ -987,12 +999,17 @@ app.post("/v1/messages", async (req, res) => {
     if (!CONFIG.AZURE_API_KEY) throw new Error("Azure API key not configured");
     if (!CONFIG.AZURE_ENDPOINT) throw new Error("Azure endpoint not configured");
 
+    const passthroughHeaders = {
+      "Content-Type": "application/json",
+      "x-api-key": CONFIG.AZURE_API_KEY,
+      "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
+    };
+    if (isSonnet45Model(req.body?.model)) {
+      passthroughHeaders["anthropic-beta"] = SONNET_1M_BETA_HEADER;
+    }
+
     const response = await axios.post(CONFIG.AZURE_ENDPOINT, req.body, {
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": CONFIG.AZURE_API_KEY,
-        "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
-      },
+      headers: passthroughHeaders,
       timeout: 120000,
       responseType: "json",
       validateStatus: (s) => s < 600,
