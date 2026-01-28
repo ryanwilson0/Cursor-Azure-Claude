@@ -54,6 +54,64 @@ curl -X POST https://cursor-azure-claude-proxy-production.up.railway.app/chat/co
 
 **Lưu ý**: Thay `YOUR_SERVICE_API_KEY` bằng giá trị thực từ biến môi trường `SERVICE_API_KEY`.
 
+## 🤖 Claude Code (CLI) setup
+
+This proxy is not only for Cursor. It also exposes Anthropic-compatible `/v1/messages`, which Claude Code uses. Point Claude Code at the proxy and reuse the same `SERVICE_API_KEY`.
+
+### Environment variables
+
+Set these in your shell before running Claude Code. (They are standard environment variables; you can also place them in your shell profile such as `~/.bashrc` or `~/.zshrc`.)
+
+```bash
+export ANTHROPIC_BASE_URL="https://cursor-azure-claude-proxy-production.up.railway.app"
+export ANTHROPIC_API_KEY="YOUR_SERVICE_API_KEY"
+```
+
+If you are on Windows PowerShell:
+
+```powershell
+$env:ANTHROPIC_BASE_URL="https://cursor-azure-claude-proxy-production.up.railway.app"
+$env:ANTHROPIC_API_KEY="YOUR_SERVICE_API_KEY"
+```
+
+### Which login method should I pick in Claude Code?
+
+Choose **“Anthropic Console account”** when you are using this proxy, because it speaks the Anthropic `/v1/messages` API. The **“3rd-party platform”** option is for connecting directly to providers like Microsoft Foundry/Bedrock/Vertex without a proxy. Use the Anthropic option and set the environment variables above to point Claude Code at the proxy.
+
+### How do I set the model in Claude Code?
+
+Claude Code’s `/model` menu only lists its built-in models. To use your Azure deployment name, start Claude Code with an explicit model flag:
+
+```bash
+claude --model claude-opus-4-5
+```
+
+or
+
+```bash
+claude --model claude-sonnet-4-5
+```
+
+Use the exact Azure deployment name you configured (e.g., `AZURE_DEPLOYMENT_OPUS` or `AZURE_DEPLOYMENT_SONNET`), because the `/v1/messages` passthrough sends the model string directly to Azure.
+
+### Example request (Anthropic messages)
+
+```bash
+curl -X POST https://cursor-azure-claude-proxy-production.up.railway.app/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-api-key: YOUR_SERVICE_API_KEY" \
+  -d '{
+    "model": "claude-opus-4-5",
+    "max_tokens": 512,
+    "messages": [
+      { "role": "user", "content": "Hello from Claude Code!" }
+    ]
+  }'
+```
+
+**Note**: `ANTHROPIC_API_KEY` must match the proxy’s `SERVICE_API_KEY`. Ensure Claude Code reads these environment variables on your machine.
+
 ## ⚙️ Environment Variables
 
 Server yêu cầu các biến môi trường sau:

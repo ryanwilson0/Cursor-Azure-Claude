@@ -999,6 +999,34 @@ app.post("/v1/messages", async (req, res) => {
     if (!CONFIG.AZURE_API_KEY) throw new Error("Azure API key not configured");
     if (!CONFIG.AZURE_ENDPOINT) throw new Error("Azure endpoint not configured");
 
+    const sanitizeAnthropicRequest = (body) => {
+      if (!body || typeof body !== "object") return body;
+
+      const allowedKeys = new Set([
+        "model",
+        "messages",
+        "system",
+        "max_tokens",
+        "temperature",
+        "stop_sequences",
+        "top_p",
+        "top_k",
+        "metadata",
+        "stream",
+        "tools",
+        "tool_choice",
+      ]);
+
+      const sanitized = {};
+      for (const [key, value] of Object.entries(body)) {
+        if (!allowedKeys.has(key)) continue;
+        sanitized[key] = value;
+      }
+      return sanitized;
+    };
+
+    const sanitizedBody = sanitizeAnthropicRequest(req.body);
+
     const passthroughHeaders = {
       "Content-Type": "application/json",
       "x-api-key": CONFIG.AZURE_API_KEY,
@@ -1008,7 +1036,7 @@ app.post("/v1/messages", async (req, res) => {
       passthroughHeaders["anthropic-beta"] = SONNET_1M_BETA_HEADER;
     }
 
-    const response = await axios.post(CONFIG.AZURE_ENDPOINT, req.body, {
+    const response = await axios.post(CONFIG.AZURE_ENDPOINT, sanitizedBody, {
       headers: passthroughHeaders,
       timeout: 120000,
       responseType: "json",
